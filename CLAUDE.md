@@ -48,10 +48,10 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 
 ### Exported API Functions
 1. `Lumax_GetApiVersion` - Returns DLL version number (constant 207)
-2. `Lumax_GetPhysicalDevices` - Returns number of connected Lumax cards (via FTDI enumeration)
+2. `Lumax_GetPhysicalDevices` - Returns number of connected Lumax cards (via libftdi1 enumeration)
 3. `Lumax_GetDeviceInfo` - Reserved for future developments
-4. `Lumax_OpenDevice` - Opens a device and returns a handle (via FTDI)
-5. `Lumax_CloseDevice` - Closes a device (via FTDI)
+4. `Lumax_OpenDevice` - Opens a device and returns a handle (via libftdi1)
+5. `Lumax_CloseDevice` - Closes a device (via libftdi1)
 6. `Lumax_SendFrame` - Sends a laser frame to the card
 7. `Lumax_WaitForBuffer` - Waits for buffer availability or returns its status
 8. `Lumax_StopFrame` - Halts laser output (sets all color channels to 0, positions X/Y to center, disables TTL outputs)
@@ -91,7 +91,7 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 
 ## Dependencies
 - The Lumax DLL depends on FTDI USB drivers (provided in `minilumax_usb_64`). Specifically, it uses the `ftd2xx.dll` library for USB communication with the FTDI chips on the Lumax cards.
-- To build the liblumax library on Linux or macOS, the FTDI D2XX driver (`libftd2xx.so` on Linux, `libftd2xx.dylib` on macOS) must be installed and available in the library search path.
+- To build the liblumax library on Linux or macOS, the FTDI library (`libftdi1`) must be installed and available in the library search path.
 
 ## Usage Example (from VB6)
 1. Call `Lumax_GetApiVersion` to verify DLL version.
@@ -104,8 +104,8 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 8. When finished, call `Lumax_CloseDevice(handle)` for each opened device.
 
 ## Next Steps for Reverse Engineering
-- We have created a stub library (`liblumax.c`) that compiles but requires the FTDI D2XX driver to link.
-- We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via FTDI), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
+- We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1.
+- We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via libftdi1), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
 - Now we will reverse engineer each remaining function from the provided `lumax.dll` and `minilumax_test/liblumax.so` using IDA Pro (MCP server available on port 13337).
 - For each function, we will:
   1. Analyze the disassembly and pseudo-code.

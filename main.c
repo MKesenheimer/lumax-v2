@@ -1,7 +1,7 @@
 /*
-To build use the following gcc statement 
-(assuming you have the d2xx library in the /usr/local/lib directory).
-gcc -o simple -L. -lftd2xx -lliblumax.so.1.0.1 -Wl,-rpath /usr/local/lib main.c
+To build use the following gcc statement
+(assuming you have libftdi1 installed in the standard location).
+gcc -o test -L. -llumax -I. -Wl,-rpath,@loader_path main.c
 */
 
 #include <stdio.h>
