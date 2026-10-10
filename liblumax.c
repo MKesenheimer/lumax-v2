@@ -143,6 +143,7 @@ int Lumax_GetPhysicalDevices(void)
 int Lumax_GetDeviceInfo(int PhysicalDevice)
 {
     /* Reserved for future developments */
+    (void)PhysicalDevice; /* Suppress unused parameter warning */
     return 0;
 }
 
@@ -258,7 +259,9 @@ int Lumax_StopFrame(int Handle)
 
 int Lumax_SetTTL(int Handle, int TTL)
 {
-    /* TODO: Implement setting TTL */
+    /* TODO: Implement setting TTL properly */
+    (void)Handle;
+    (void)TTL;
     return 0;
 }
 
@@ -318,6 +321,32 @@ int lumax_init_device(struct lumax_device *dev)
 {
     /* TODO: Implement */
     return 0;
+}
+
+/* Helper functions reverse engineered from liblumax.so */
+static int U9mp(int handle)
+{
+    /* TODO: Implement proper device validation */
+    (void)handle;
+    return 0; /* Assume device is valid for now */
+}
+
+static int nmg11(int handle, intptr_t buffer, int length)
+{
+    /* TODO: Implement actual USB write using libftdi1 */
+    (void)handle;
+    (void)buffer;
+    (void)length;
+    return 0; /* Placeholder */
+}
+
+static int bnQQ(int handle, intptr_t buffer, int length)
+{
+    /* TODO: Implement actual USB read using libftdi1 */
+    (void)handle;
+    (void)buffer;
+    (void)length;
+    return 0; /* Placeholder */
 }
 
 int clearBuffer(struct lumax_device *dev)

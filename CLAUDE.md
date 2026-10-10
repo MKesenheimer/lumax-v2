@@ -106,7 +106,7 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 ## Next Steps for Reverse Engineering
 - We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1.
 - We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via libftdi1), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
-- Now we will reverse engineer each remaining function from the provided `lumax.dll` and `minilumax_test/liblumax.so` using IDA Pro (MCP server available on port 13337).
+- Now we will reverse engineer each remaining function from the provided `lumax.dll` and `minilumax_test/liblumax.so` using IDA Pro (MCP servers available on ports 13337 and 13338).
 - For each function, we will:
   1. Analyze the disassembly and pseudo-code.
   2. Update the implementation in `liblumax.c`.
@@ -114,4 +114,5 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 - Focus on how the DLL interacts with the FTDI driver (`ftd2xx.dll`) to perform USB I/O.
 - Examine the frame sending process, buffer handling, and device initialization sequence.
 - Consider the safety features (e.g., emergency stop via `Lumax_StopFrame`) and how they are implemented.
-- Utilize the IDA Pro MCP server running on port 13337 for advanced reverse engineering analysis.
+- Utilize the IDA Pro MCP servers running on ports 13337 and 13338 for advanced reverse engineering analysis.
+- Check availability of MCP server with `curl -s http://127.0.0.1:13337/config.html 2>/dev/null || echo "IDA Pro MCP server not available"` or `curl -s http://127.0.0.1:13338/config.html 2>/dev/null || echo "IDA Pro MCP server not available"`. Don't use endpoint `/health`, as it does not exist.
