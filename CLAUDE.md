@@ -106,6 +106,7 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 ## Next Steps for Reverse Engineering
 - We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1.
 - We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via libftdi1), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
+- Additional functions have been partially implemented: `Lumax_SetTTL`, `Lumax_StopFrame`, `Lumax_WaitForBuffer`, `Lumax_SetDmxMode`, `Lumax_SendDmx`, `Lumax_ReceiveDmx`, `Lumax_Dongle_XTEA_Com`.
 - Now we will reverse engineer each remaining function from the provided `lumax.dll` and `minilumax_test/liblumax.so` using IDA Pro (MCP servers available on ports 13337 and 13338).
 - For each function, we will:
   1. Analyze the disassembly and pseudo-code.

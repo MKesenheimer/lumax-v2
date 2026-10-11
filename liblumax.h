@@ -40,6 +40,10 @@ struct lumax_device {
     // per-card busy tracking
     uint32_t IsBusy;             // set on a short FTDI write
     uint32_t BusyTime;           // timeGetTime() when the busy state began
+
+    // temporary buffers for helper functions
+    uint8_t  write_buffer[256];  // last written buffer (for echo simulation)
+    uint32_t write_len;          // length of last written buffer
 };
 
 #ifndef WINDOWS

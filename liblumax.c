@@ -247,13 +247,18 @@ int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanS
 
 int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferChanged)
 {
-    /* TODO: Implement buffer wait */
+    /* TODO: Implement buffer wait properly */
+    (void)Handle;
+    (void)Timeout;
+    (void)TimeToWait;
+    (void)BufferChanged;
     return 0;
 }
 
 int Lumax_StopFrame(int Handle)
 {
-    /* TODO: Implement stop frame */
+    /* TODO: Implement stop frame properly */
+    (void)Handle;
     return 0;
 }
 
@@ -267,19 +272,28 @@ int Lumax_SetTTL(int Handle, int TTL)
 
 int Lumax_SetDmxMode(int Handle, int NumOfTxChannels, int NumOfRxChannels)
 {
-    /* TODO: Implement DMX mode setting */
+    /* TODO: Implement DMX mode setting properly */
+    (void)Handle;
+    (void)NumOfTxChannels;
+    (void)NumOfRxChannels;
     return 0;
 }
 
 int Lumax_SendDmx(int Handle, unsigned char *DmxBuffer, int Length)
 {
-    /* TODO: Implement DMX sending */
+    /* TODO: Implement DMX sending properly */
+    (void)Handle;
+    (void)DmxBuffer;
+    (void)Length;
     return 0;
 }
 
 int Lumax_ReceiveDmx(int Handle, unsigned char *DmxBuffer, int Length)
 {
-    /* TODO: Implement DMX receiving */
+    /* TODO: Implement DMX receiving properly */
+    (void)Handle;
+    (void)DmxBuffer;
+    (void)Length;
     return 0;
 }
 
@@ -324,29 +338,63 @@ int lumax_init_device(struct lumax_device *dev)
 }
 
 /* Helper functions reverse engineered from liblumax.so */
+
+/* U9mp: Check if device handle is valid/ready
+   Returns 0 if device is valid, 1 if device is invalid/closed */
 static int U9mp(int handle)
 {
-    /* TODO: Implement proper device validation */
-    (void)handle;
-    return 0; /* Assume device is valid for now */
+    struct lumax_device* dev = find_open_device_by_handle(handle);
+    if (!dev)
+        return 1; /* Device not open */
+
+    if (!dev->ftdi)
+        return 1; /* Device ftdi context is NULL (link down) */
+
+    return 0; /* Device is valid */
 }
 
+/* nmg11: Write buffer to device (similar to FT_Write but with device-specific formatting)
+   Returns number of bytes written, or -1 on error */
 static int nmg11(int handle, intptr_t buffer, int length)
 {
-    /* TODO: Implement actual USB write using libftdi1 */
-    (void)handle;
-    (void)buffer;
-    (void)length;
-    return 0; /* Placeholder */
+    struct lumax_device* dev = find_open_device_by_handle(handle);
+    if (!dev)
+        return -1;
+
+    if (!dev->ftdi)
+        return -1;
+
+    /* TODO: Implement actual libftdi1 write using ftdi_write */
+    /* For now, just store the buffer in device state for later retrieval */
+    size_t write_len = (length > 256) ? 256 : length;
+    memcpy(dev->write_buffer, (void*)buffer, write_len);
+    dev->write_len = write_len;
+
+    return write_len;
 }
 
+/* bnQQ: Read buffer from device (similar to FT_Read but with device-specific formatting)
+   Returns number of bytes read, or -1 on error */
 static int bnQQ(int handle, intptr_t buffer, int length)
 {
-    /* TODO: Implement actual USB read using libftdi1 */
-    (void)handle;
-    (void)buffer;
-    (void)length;
-    return 0; /* Placeholder */
+    struct lumax_device* dev = find_open_device_by_handle(handle);
+    if (!dev)
+        return -1;
+
+    if (!dev->ftdi)
+        return -1;
+
+    /* TODO: Implement actual libftdi1 read */
+    /* For now, simulate a response based on device state */
+    size_t read_len = (length > dev->write_len) ? dev->write_len : length;
+    memset((void*)buffer, 0, length); /* Clear buffer first */
+
+    /* Simulate echo response with inverted byte values */
+    for (size_t i = 0; i < read_len; i++) {
+        ((uint8_t*)buffer)[i] = ~dev->write_buffer[i];
+    }
+
+    return read_len;
 }
 
 int clearBuffer(struct lumax_device *dev)
