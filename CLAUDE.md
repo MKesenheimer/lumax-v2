@@ -49,15 +49,19 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 ### Exported API Functions
 1. `Lumax_GetApiVersion` - Returns DLL version number (constant 207)
 2. `Lumax_GetPhysicalDevices` - Returns number of connected Lumax cards (via libftdi1 enumeration)
-3. `Lumax_GetDeviceInfo` - Reserved for future developments
+3. `Lumax_GetDeviceInfo` - Reverse-engineered analysis shows this function queries device information from a global structure. It takes a PhysicalDevice index and optional parameters to return different types of device info:
+   - With second parameter = 1: attempts to copy 9 bytes of device data to a provided buffer
+   - With second parameter = 2: attempts to write a single byte value to a provided buffer
+   - Otherwise: returns status based on device validity
+   Currently reserved for future developments; returns 0 in our stub implementation.
 4. `Lumax_OpenDevice` - Opens a device and returns a handle (via libftdi1)
 5. `Lumax_CloseDevice` - Closes a device (via libftdi1)
 6. `Lumax_SendFrame` - Sends a laser frame to the card
-7. `Lumax_WaitForBuffer` - Waits for buffer availability or returns its status
+7. `Lumax_WaitForBuffer` - Waits for buffer availability or returns its status. Reverse-engineered analysis shows this function sends a 7-byte command to query buffer status and interprets the response to determine if the buffer has changed and calculate wait time. Implemented using libftdi1 write/read functions.
 8. `Lumax_StopFrame` - Halts laser output (sets all color channels to 0, positions X/Y to center, disables TTL outputs)
-9. `Lumax_SetTTL` - Sets TTL outputs
-10. `Lumax_SetDmxMode` - Activates/deactivates DMX512 sender/receiver on the MiniLumax card
-11. `Lumax_SendDmx` - Transmits DMX512 data to the MiniLumax card's output buffer
+9. `Lumax_SetTTL` - Reverse-engineered analysis shows this function sets TTL outputs by sending a 7-byte command [0x30, TTL, 0, 0, 0, 0, 0] and verifying the response equals (TTL XOR 0x1E). Implemented using libftdi1 write/read functions.
+10. `Lumax_SetDmxMode` - Activates/deactivates DMX512 sender/receiver on the MiniLumax card. Reverse-engineered analysis shows this function sends two 7-byte commands (one for TX channels, one for RX channels) and verifies single-byte responses using checksums. Implemented using libftdi1 write/read functions.
+11. `Lumax_SendDmx` - Transmits DMX512 data to the MiniLumax card's output buffer. Reverse-engineered analysis shows this function sends DMX data via the Tj4 helper function; implemented as a wrapper around Tj4 with appropriate parameters.
 12. `Lumax_ReceiveDmx` - Receives DMX512 data from the MiniLumax card's input buffer
 13. `Lumax_Dongle_XTEA_Com` - Performs dongle communication (XTEA encryption)
 14. `Lumax_ExchangeDevInfo` - Exchanges device information
@@ -104,14 +108,19 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 8. When finished, call `Lumax_CloseDevice(handle)` for each opened device.
 
 ## Next Steps for Reverse Engineering
-- We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1.
+- We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1, including actual libftdi1 read/write operations in the helper functions.
 - We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via libftdi1), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
-- Additional functions have been partially implemented: `Lumax_SetTTL`, `Lumax_StopFrame`, `Lumax_WaitForBuffer`, `Lumax_SetDmxMode`, `Lumax_SendDmx`, `Lumax_ReceiveDmx`, `Lumax_Dongle_XTEA_Com`.
-- Now we will reverse engineer each remaining function from the provided `lumax.dll` and `minilumax_test/liblumax.so` using IDA Pro (MCP servers available on ports 13337 and 13338).
-- For each function, we will:
-  1. Analyze the disassembly and pseudo-code.
-  2. Update the implementation in `liblumax.c`.
-  3. Update the CLAUDE.md with our findings.
+- We have analyzed `Lumax_GetDeviceInfo` (reverse-engineered shows it queries device information from internal structures; kept as stub returning 0 as it's reserved for future developments).
+- We have analyzed and implemented `Lumax_SetTTL` (reverse-engineered shows it sets TTL outputs via command/response verification; implemented using libftdi1).
+- We have analyzed and implemented `Lumax_StopFrame` (reverse-engineered shows it halts laser output via command/response; implemented using libftdi1).
+- We have analyzed and implemented `Lumax_WaitForBuffer` (reverse-engineered shows it waits for buffer status via command/response; implemented using libftdi1).
+- We have analyzed and implemented `Lumax_SendFrame` (reverse-engineered shows it formats and sends laser point data to the device; implemented using libftdi1).
+- We have analyzed and implemented `Lumax_SetDmxMode` (reverse-engineered shows it activates/deactivates DMX512 sender/receiver via command/response; implemented using libftdi1).
+- We have analyzed and implemented `Lumax_SendDmx` (reverse-engineered shows it transmits DMX512 data via Tj4 helper function; implemented as a wrapper around Tj4 with appropriate parameters).
+- We have implemented the device initialization sequence in `lumax_init_device` that includes reset, buffer clearing, ID reading, memory reading, dongle exchange, flavor key transmission, stop frame, DMX off, and TTL off.
+- We have implemented all internal helper functions from liblumax.h: openDev, openDevBySerial, lumax_init_device, clearBuffer, checkIfBusy, isOpen, sendInitKey, sendKey, writeToDev, readFromDev, writeFrameBuffer, readID, readMemory, Lumax_SetBlankingDelay, dongleCom.
+- Remaining functions to implement or analyze: `Lumax_ReceiveDmx`, `Lumax_Dongle_XTEA_Com`, `Lumax_ExchangeDevInfo`, `Lumax_SetDacValue`.
+- The library now successfully builds as a shared library (liblumax.dylib on macOS) using pkg-config to manage FTDI and USB library dependencies.
 - Focus on how the DLL interacts with the FTDI driver (`ftd2xx.dll`) to perform USB I/O.
 - Examine the frame sending process, buffer handling, and device initialization sequence.
 - Consider the safety features (e.g., emergency stop via `Lumax_StopFrame`) and how they are implemented.

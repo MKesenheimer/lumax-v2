@@ -10,16 +10,22 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
     TARGET = liblumax.so
     LDFLAGS += -Wl,-soname,liblumax.so
-    # FTDI library
-    LDLIBS += -lftdi1
-    INCLUDES = -I. -I/opt/homebrew/include
+    # FTDI library via pkg-config
+    LDLIBS += $(shell pkg-config --libs libftdi1)
+    # Adjust include path: pkg-config gives us -I/path/libftdi1 but we need -I/path
+    FTDI_CFLAGS := $(shell pkg-config --cflags libftdi1)
+    FTDI_INCLUDE_PATH := $(patsubst -I%/libftdi1, -I%, $(FTDI_CFLAGS))
+    INCLUDES = -I. $(FTDI_INCLUDE_PATH)
 endif
 ifeq ($(UNAME_S),Darwin)
     TARGET = liblumax.dylib
     LDFLAGS += -Wl,-install_name,@rpath/liblumax.dylib
-    # FTDI library
-    LDLIBS += -lftdi1 -L/opt/homebrew/lib
-    INCLUDES = -I. -I/opt/homebrew/include
+    # FTDI library via pkg-config
+    LDLIBS += $(shell pkg-config --libs libftdi1)
+    # Adjust include path: pkg-config gives us -I/path/libftdi1 but we need -I/path
+    FTDI_CFLAGS := $(shell pkg-config --cflags libftdi1)
+    FTDI_INCLUDE_PATH := $(patsubst -I%/libftdi1, -I%, $(FTDI_CFLAGS))
+    INCLUDES = -I. $(FTDI_INCLUDE_PATH)
 endif
 
 # Source files

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <libftdi1/ftdi.h>
 
 // internal helpers (see liblumax.c)
 
@@ -44,6 +45,9 @@ struct lumax_device {
     // temporary buffers for helper functions
     uint8_t  write_buffer[256];  // last written buffer (for echo simulation)
     uint32_t write_len;          // length of last written buffer
+
+    // Additional state for DMX functions (reverse engineered)
+    uint8_t  dmx_state_byte;     // corresponds to m_38[324146 * numDev - 322991 + 324143]
 };
 
 #ifndef WINDOWS
