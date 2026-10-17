@@ -42,6 +42,8 @@ int main()
       printf("Lumax_SendFrame return code: %i\n", result);
       result = Lumax_WaitForBuffer(Handle, 0, &TimeToWait, &BufferChanged);
       printf("Lumax_WaitForBuffer return code: %i   TimeToWait=%i, BufferChanged=%i\n", result, TimeToWait, BufferChanged);
+      result = Lumax_StopFrame(Handle);
+      printf("Lumax_StopFrame return code: %i\n", result);
       result = Lumax_CloseDevice(Handle);
       printf("Lumax_CloseDevice return code: %i\n", result);
      }
