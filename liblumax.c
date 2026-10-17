@@ -17,6 +17,21 @@
 static int U9mp(int handle);
 static int nmg11(int handle, intptr_t buffer, int length);
 static int bnQQ(int handle, intptr_t buffer, int length);
+static int fvr(int handle, intptr_t dmx_buffer, unsigned short cmd, unsigned short length, char flag);
+static int vN67(int handle, char command, int address, intptr_t write_buf, intptr_t read_buf);
+
+/*
+ * Debug tracing, enabled by setting LUMAX_DEBUG in the environment
+ * (e.g. LUMAX_DEBUG=1 ./test). Silent by default.
+ */
+static int lumax_debug_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = (getenv("LUMAX_DEBUG") != NULL) ? 1 : 0;
+    return enabled;
+}
+#define DBG(fmt, ...) do { if (lumax_debug_enabled()) fprintf(stderr, "[lumax] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* Maximum number of devices we can handle */
 #define MAX_DEVICES 8
@@ -29,10 +44,67 @@ static int num_open_devices = 0;
 static struct lumax_device detected_devices[MAX_DEVICES];
 static int num_detected_devices = 0;
 
-/* Stub for ghrkr */
-static void ghrkr(void) {
-    /* TODO: Implement */
-    return;
+/*
+ * Fallback per-card configuration, applied by ghrkr().
+ *
+ * In liblumax.so these are the defaults ghrkr() writes into each of the 8
+ * device slots of the m_38[] backing array:
+ *   field 1191 = 31500 / 7 = 4500  (points per frame-buffer chunk -> MaxPoints)
+ *   field 1206 = 45000             (max scan speed PPS            -> MaxScanSpeed)
+ *   field 1204 = 1                 (frame-header layout byte      -> BufferLayout)
+ *
+ * They are pure fallbacks: lumax_init_device() re-derives the real values from
+ * the card's memory (256 * mem[5], 100 * mem[6]) and those override the
+ * defaults when non-zero. The fallbacks exist so SendFrame()'s arithmetic
+ * (it divides by MaxPoints and clamps to MaxScanSpeed) stays valid even for a
+ * slot whose memory read yielded 0. The scan-speed preset tables that ghrkr
+ * also fills in the .so are not modelled here because this port's
+ * writeFrameBuffer() is a raw ftdi_write_data that never consults them.
+ */
+#define GHKR_FALLBACK_MAX_POINTS   4500
+#define GHKR_FALLBACK_MAX_SCANSPEED 45000
+#define GHKR_FALLBACK_BUFFER_LAYOUT 1
+#define GHKR_FALLBACK_FLAVOR       1
+
+/* Fill any unset (0) config field from the ghrkr() fallback values. */
+static void apply_fallback_config(struct lumax_device *dev)
+{
+    if (!dev)
+        return;
+    if (dev->MaxPoints == 0)
+        dev->MaxPoints = GHKR_FALLBACK_MAX_POINTS;
+    if (dev->MaxScanSpeed == 0)
+        dev->MaxScanSpeed = GHKR_FALLBACK_MAX_SCANSPEED;
+    if (dev->BufferLayout == 0)
+        dev->BufferLayout = GHKR_FALLBACK_BUFFER_LAYOUT;
+    if (dev->Flavor == 0)
+        dev->Flavor = GHKR_FALLBACK_FLAVOR;
+}
+
+/*
+ * One-time lazy global constructor (analogous to the .so's Constructor_State
+ * guard). Pre-sets every device slot's fallback configuration exactly once.
+ *
+ * The .so version mallocs the 10.6 MB m_38[] array and initialises all 8 slots
+ * (chunk size, max scan speed, buffer layout, and the per-flavor scan-speed
+ * preset tables). This port keeps its device records in the static
+ * open_devices[]/detected_devices[] arrays (already zero-initialised, no
+ * malloc) and does not model the preset tables, so the faithful equivalent is:
+ * set the config fallbacks on the open-device slots. The guard makes it safe to
+ * call from any entry point; it is a no-op after the first run.
+ */
+static void ghrkr(void)
+{
+    static int initialized = 0;
+    int i;
+
+    if (initialized)
+        return;
+
+    for (i = 0; i < MAX_DEVICES; i++)
+        apply_fallback_config(&open_devices[i]);
+
+    initialized = 1;
 }
 
 /* Helper function to find device by serial number */
@@ -156,6 +228,10 @@ int Lumax_GetDeviceInfo(int PhysicalDevice)
 
 int Lumax_OpenDevice(int PhysicalDevice, int Channel)
 {
+    /* One-time global init (idempotent; matches the .so, which calls ghrkr()
+     * from both GetPhysicalDevices and OpenDevice). */
+    ghrkr();
+
     /* Check if PhysicalDevice is valid */
     if (PhysicalDevice < 1 || PhysicalDevice > num_detected_devices)
         return 0;
@@ -178,11 +254,14 @@ int Lumax_OpenDevice(int PhysicalDevice, int Channel)
     /* Open the device using libftdi1 */
     struct ftdi_context *ftdi = ftdi_new();
     if (!ftdi) {
+        DBG("ftdi_new failed");
         return 0;
     }
 
     /* Open device by VID/PID and serial number */
-    if (ftdi_usb_open_desc(ftdi, 0x403, 0xC88A, NULL, dev->serial) < 0) {
+    int open_rc = ftdi_usb_open_desc(ftdi, 0x403, 0xC88A, NULL, dev->serial);
+    DBG("ftdi_usb_open_desc(serial='%s') = %d", dev->serial, open_rc);
+    if (open_rc < 0) {
         ftdi_free(ftdi);
         return 0;
     }
@@ -195,19 +274,21 @@ int Lumax_OpenDevice(int PhysicalDevice, int Channel)
 
     /* Initialize the device (reset, etc.) */
     if (lumax_init_device(openDev) != 0) {
-        /* Initialization failed, clean up */
-        ftdi_usb_close(ftdi);
+        DBG("lumax_init_device failed");
         ftdi_free(ftdi);
         return 0;
     }
 
     /* Initialize the device state values */
-    openDev->BufferLayout = 1; /* default */
+    /* BufferLayout/Flavor/MaxPoints/MaxScanSpeed were read from the card's
+     * memory by lumax_init_device() above. Don't zero them out; instead fill
+     * any that came back 0 from the ghrkr() fallbacks (see
+     * apply_fallback_config). This mirrors the .so, where the ghrkr() defaults
+     * are only overridden by the real card values. TTLBuffer/TTLAvailable are
+     * per-session state and are reset to 0 on each open. */
     openDev->TTLBuffer = 0;
     openDev->TTLAvailable = 0;
-    openDev->Flavor = 1; /* default */
-    openDev->MaxPoints = 0; /* will be set during init */
-    openDev->MaxScanSpeed = 0;
+    apply_fallback_config(openDev);
     openDev->DmxFlavorMask = 0;
     openDev->NextLoopCounts = 0;
     openDev->TimeUntilFree = 0;
@@ -602,31 +683,251 @@ int Lumax_SetDmxMode(int Handle, int NumOfTxChannels, int NumOfRxChannels)
 
 int Lumax_ReceiveDmx(int Handle, unsigned char *DmxBuffer, int Length)
 {
-    /* TODO: Implement DMX receiving properly */
-    (void)Handle;
-    (void)DmxBuffer;
-    (void)Length;
-    return 0;
+    /* Receive a DMX frame from the card. Port of fvr/Lumax_ReceiveDmx
+       (liblumax.so) — a 7-byte header [2, cmd(0xFB0C), len, flag, checksum]
+       is sent, the card echoes the header checksum, streams the Length data
+       bytes, and finally a data checksum (XOR of all data bytes) is checked. */
+    if (Length <= 0 || Length > 1025 || U9mp(Handle))
+        return 1;
+    return fvr(Handle, (intptr_t)DmxBuffer, 0xFB0C, (unsigned short)Length, 1);
 }
 
 /* Dongle and exchange functions (not in VB API but exported) */
 
+/* ---- Dongle (XTEA copy-protection) layer ----
+ *
+ * The dongle is addressed over the 24-byte XTEA packet (vN67). There are two
+ * levels in the reference binaries:
+ *
+ *   .so : vN67 (24-byte transaction)  <- Lumax_DongleCom  (raw command set)
+ *   .dll: sub_406068 (24-byte txn)    <- sub_4061D4 (raw) <- Lumax_Dongle_XTEA_Com (1-9)
+ *
+ * We port both levels. dongleRawCom() mirrors the raw command layer
+ * (Lumax_DongleCom / sub_4061D4): it runs one vN67 transaction for a raw
+ * dongle command and interprets the response's status byte (byte 12 of the
+ * 13-byte payload). The public entry points wrap it.
+ *
+ * Data buffers are arrays of 32-bit words. The 32-bit reference typed them as
+ * int*; the public header types them as unsigned long*. On this 64-bit
+ * platform the words are therefore accessed at a fixed 4-byte stride (matching
+ * the original memory layout) rather than sizeof(unsigned long).
+ */
+#define DONGLE_DEFAULT_ADDR 1238675770u /* fixed dongle base used by cmds 1/43/85/90 */
+
+static uint32_t dw_get(const unsigned char *p, int idx)
+{
+    uint32_t v;
+    memcpy(&v, p + 4 * idx, 4);
+    return v;
+}
+static void dw_set(unsigned char *p, int idx, uint32_t v)
+{
+    memcpy(p + 4 * idx, &v, 4);
+}
+
+/* Run one raw dongle command. in = 16-byte write payload (may be NULL);
+   data_out = response-word buffer, 4-byte stride (may be NULL). Returns 0 on
+   success or a 2xx dongle error code, 1 on transport/unknown failure.
+   Mirrors Lumax_DongleCom (liblumax.so) / sub_4061D4 (lumax.dll). */
+static int dongleRawCom(int handle, int cmd, int address,
+                        const unsigned char *in, unsigned char *data_out)
+{
+    unsigned char write16[16] = {0};
+    unsigned char resp[13];
+    uint32_t status, resp0;
+    int addr;
+
+    /* Original precondition: cmd 90 requires a caller 16-byte write payload. */
+    if (cmd == 90 && !in)
+        return 1;
+
+    /* Per-command 16-byte write payload (mirrors the original's per-command
+       stack buffer construction; unused bytes stay zero). */
+    switch (cmd) {
+    case 90:
+    case 132:
+        if (in) memcpy(write16, in, 16);
+        break;
+    case 133:
+    case 134:
+        if (in) memcpy(write16, in, 8); /* two caller words */
+        break;
+    case 130:
+        if (in) write16[4] = (unsigned char)((4 * in[0]) & 0xC);
+        break;
+    case 131:
+        if (in) write16[4] = (unsigned char)((4 * in[0]) & 0xC);
+        if (data_out) memcpy(write16, data_out, 4); /* v6 = *a5 (first word) */
+        break;
+    case 43:
+        if (in) write16[0] = in[0];
+        break;
+    case 1:
+    case 85:
+    default:
+        break;
+    }
+
+    /* Commands 1, 43, 85 and 90 always target the default dongle address. */
+    addr = (cmd == 1 || cmd == 43 || cmd == 85 || cmd == 90)
+              ? (int)DONGLE_DEFAULT_ADDR
+              : address;
+
+    if (vN67(handle, (char)cmd, addr, (intptr_t)write16, (intptr_t)resp) != 0)
+        return 1;
+
+    status = resp[12];
+    resp0  = resp[0];
+
+    if (status == 0) {
+        switch (cmd) {
+        case 1:
+            if (data_out) dw_set(data_out, 0, (uint32_t)resp[0]);
+            return 0;
+        case 85:
+            /* original: resp byte 1 == 0xFF is a distinct 201 condition */
+            if (resp[1] == 0xFF) return 201;
+            return (resp0 == 0) ? 0 : 206;
+        case 43:
+        case 90:
+        case 131:
+        case 132:
+            return (resp0 == 0) ? 0 : 206;
+        case 129:
+            if (data_out) {
+                dw_set(data_out, 0, dw_get(resp, 0));
+                dw_set(data_out, 1, dw_get(resp, 4));
+                dw_set(data_out, 2, dw_get(resp, 8));
+            }
+            return 0;
+        case 133:
+        case 134:
+            if (data_out) {
+                dw_set(data_out, 0, dw_get(resp, 0));
+                dw_set(data_out, 1, dw_get(resp, 4));
+            }
+            return 0;
+        case 130:
+            if (data_out) dw_set(data_out, 0, dw_get(resp, 0));
+            return 0;
+        }
+        return 1;
+    }
+
+    if (status == 1)
+        return 205;
+
+    if (status == 2) {
+        if (cmd == 90) {
+            if (resp0 == 0xFF) return 201;
+            if (resp0 == 2)    return 203;
+            if (resp0 == 0xFE) return 204;
+        } else if (cmd != 1 && cmd != 43 && cmd != 85) {
+            /* 129, 130, 131, 132, 133, 134 */
+            if (resp0 == 0xFF) return 201;
+            if (resp0 == 1)    return 202;
+            if (resp0 == 0xFE) return 204;
+        }
+        /* cmds 1, 43, 85 do not special-case status 2; fall through. */
+    }
+    return 1;
+}
+
+/* Public raw-command dongle entry (Lumax_DongleCom in liblumax.so; declared in
+   lumax.h). Raw command set: 1, 43, 85, 90, 129, 130, 131, 132, 133, 134. */
+int Lumax_DongleCom(int PhysicalDevice, int Command, unsigned long Vendor_ID, unsigned long *DataOut, unsigned long *DataIn)
+{
+    unsigned char *in  = (unsigned char *)DataOut;
+    unsigned char *out = (unsigned char *)DataIn;
+    int r;
+
+    if (U9mp(PhysicalDevice))
+        return 1; /* device not open / link down */
+
+    /* Original preconditions: 132 and 85 require a magic sentinel word the
+       caller pre-loads into DataIn[0] before the call. */
+    if (Command == 132) {
+        if (!DataOut || !DataIn || dw_get((const unsigned char *)DataIn, 0) != 1442775125u)
+            return 1;
+    } else if (Command == 85) {
+        if (!DataIn || (int32_t)dw_get((const unsigned char *)DataIn, 0) != -11184896)
+            return 1;
+    }
+
+    r = dongleRawCom(PhysicalDevice, Command, (int)Vendor_ID, in, out);
+    return r;
+}
+
+/* Public 1-9 command entry (Lumax_Dongle_XTEA_Com in lumax.dll). Maps the
+   public command onto the raw set and runs it via dongleRawCom; command 1
+   ("dongle present") additionally remaps the card's one-byte answer. */
 int Lumax_Dongle_XTEA_Com(int PhysicalDevice, int Command, unsigned long Vendor_ID, unsigned long *DataOut, unsigned long *DataIn)
 {
-    /* TODO: Implement dongle communication */
-    return 0;
+    int raw;
+
+    if (U9mp(PhysicalDevice))
+        return 1; /* device not open / link down */
+
+    switch (Command) {
+    case 1: {
+        /* Query dongle present: raw 1 returns one byte, remap it. */
+        uint32_t val = 0;
+        if (!DataIn)
+            return 1;
+        dw_set((unsigned char *)DataIn, 0, 0);
+        if (dongleRawCom(PhysicalDevice, 1, 0, NULL, (unsigned char *)DataIn) == 0) {
+            val = dw_get((const unsigned char *)DataIn, 0);
+            if (val == 1)
+                dw_set((unsigned char *)DataIn, 0, 2);
+            else if (val == 2)
+                dw_set((unsigned char *)DataIn, 0, 1);
+            else if (val == 254)
+                dw_set((unsigned char *)DataIn, 0, 3);
+            return 0;
+        }
+        return 1;
+    }
+    case 2: raw = 90;  break;
+    case 3: raw = 129; break;
+    case 4: raw = 131; break;
+    case 5: raw = 130; break;
+    case 6: raw = 133; break;
+    case 7: raw = 134; break;
+    case 8: raw = 132; break;
+    case 9: raw = 85;  break;
+    default:
+        return 1;
+    }
+
+    return dongleRawCom(PhysicalDevice, raw, (int)Vendor_ID,
+                        (const unsigned char *)DataOut, (unsigned char *)DataIn);
 }
 
 int Lumax_ExchangeDevInfo(int PhysicalDevice, unsigned long *Vendor_ID, unsigned long *Product_ID, unsigned long *Version, unsigned long *Features)
 {
-    /* TODO: Implement device info exchange */
-    return 0;
+    /* Exchange device info. In lumax.dll this is tightly bound to the
+       obfuscated per-device Block struct (a marker write plus a
+       version/features read-back). That struct is not ported 1:1 here, so
+       this remains a documented stub: it validates its inputs and reports
+       "not supported" (1) rather than touching unmodelled state. */
+    if (PhysicalDevice <= 0 || PhysicalDevice > MAX_DEVICES)
+        return 1;
+    if (!Vendor_ID || !Product_ID || !Version || !Features)
+        return 1;
+    (void)Vendor_ID;
+    (void)Product_ID;
+    (void)Version;
+    (void)Features;
+    return 1;
 }
 
 int Lumax_SetDacValue(int Handle, int Value)
 {
-    /* TODO: Implement DAC value setting */
-    return 0;
+    /* No-op in the reference implementation (lumax.dll Lumax_SetDacValue
+       unconditionally returns 1). Kept for API/export compatibility. */
+    (void)Handle;
+    (void)Value;
+    return 1;
 }
 
 /* Internal helper functions (from liblumax.h) */
@@ -668,6 +969,7 @@ int lumax_init_device(struct lumax_device *dev)
         return -1;
 
     int result;
+    int i;
 
     /* 1. Reset the per-card state */
     /* Based on analysis, this sends 256 zero bytes with "GNU" string */
@@ -678,6 +980,7 @@ int lumax_init_device(struct lumax_device *dev)
     reset_buf[258] = 'U';
 
     int written = ftdi_write_data(dev->ftdi, reset_buf, 259);
+    DBG("init step1 reset write = %d (expect 259)", written);
     if (written != 259) {
         return -1; /* Failed to write reset sequence */
     }
@@ -687,6 +990,7 @@ int lumax_init_device(struct lumax_device *dev)
 
     /* 2. Clear buffer */
     result = clearBuffer(dev);
+    DBG("init step2 clearBuffer = %d (expect 1)", result);
     if (result != 1) {
         return -1; /* Failed to clear buffer */
     }
@@ -694,6 +998,9 @@ int lumax_init_device(struct lumax_device *dev)
     /* 3. ReadID */
     unsigned char id_buffer[16];
     result = readID(dev, id_buffer, 16);
+    DBG("init step3 readID = %d", result);
+    for (i = 0; i < result && i < 16; i++)
+        DBG("  id[%d]=0x%02x", i, id_buffer[i]);
     if (result < 0) {
         return -1; /* Failed to read ID */
     }
@@ -707,6 +1014,11 @@ int lumax_init_device(struct lumax_device *dev)
     /* 4. ReadMemory */
     unsigned char mem_buffer[64];
     result = readMemory(dev, mem_buffer, 0, 63);
+    DBG("init step4 readMemory = %d", result);
+    if (result >= 8) {
+        for (i = 0; i < result && i < 16; i++)
+            DBG("  mem[%d]=0x%02x", i, mem_buffer[i]);
+    }
     if (result < 0) {
         return -1; /* Failed to read memory */
     }
@@ -726,30 +1038,35 @@ int lumax_init_device(struct lumax_device *dev)
     unsigned char dongle_write[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
     unsigned char dongle_read[8];
     result = dongleCom(dev, 0x01, 0x0000, dongle_write, dongle_read);
+    DBG("init step5 dongleCom = %d (expect 1)", result);
     if (result != 1) {
         return -1; /* Dongle exchange failed */
     }
 
     /* Flavor key */
     result = sendKey(dev, dev->Flavor);
+    DBG("init step5b sendKey(flavor=%d) = %d (expect 1)", dev->Flavor, result);
     if (result != 1) {
         return -1; /* Failed to send flavor key */
     }
 
     /* 6. Stop frame */
     result = Lumax_StopFrame(0); /* Handle 0 means use current device context */
+    DBG("init step6 Lumax_StopFrame(0) = %d (expect 1)", result);
     if (result != 1) {
         return -1; /* Stop frame failed */
     }
 
     /* 7. DMX off */
     result = Lumax_SetDmxMode(0, 0, 0);
+    DBG("init step7 Lumax_SetDmxMode(0,0,0) = %d (expect 1)", result);
     if (result != 1) {
         return -1; /* Failed to turn DMX off */
     }
 
     /* 8. TTL off */
     result = Lumax_SetTTL(0, 0);
+    DBG("init step8 Lumax_SetTTL(0,0) = %d (expect 1)", result);
     if (result != 1) {
         return -1; /* Failed to turn TTL off */
     }
@@ -809,6 +1126,115 @@ static int bnQQ(int handle, intptr_t buffer, int length)
         return -1;
     }
     return read_len;
+}
+
+/* fvr: receive a framed block from the card (DMX). Port of fvr (liblumax.so).
+   Sends a 7-byte header [2, cmd_lo, cmd_hi, len_lo, len_hi, flag, checksum]
+   where checksum = XOR(header[0..5]); the card echoes that checksum (1 byte),
+   streams `length` data bytes into dmx_buffer, then sends a data checksum
+   (1 byte) which must equal the XOR of all data bytes. 0 on success, 1 on
+   any I/O or checksum mismatch. (Our nmg11/bnQQ return byte counts, so
+   success is "read exactly N", unlike the .so where they return 0=OK.) */
+static int fvr(int handle, intptr_t dmx_buffer, unsigned short cmd, unsigned short length, char flag)
+{
+    unsigned char header[7];
+    unsigned char *buf = (unsigned char *)dmx_buffer;
+    unsigned char echo, data_checksum, x;
+    int i;
+
+    if (!length || (unsigned int)(length + cmd) > 0x10000)
+        return 1;
+
+    header[0] = 2;
+    header[1] = cmd & 0xFF;
+    header[2] = (cmd >> 8) & 0xFF;
+    header[3] = length & 0xFF;
+    header[4] = (length >> 8) & 0xFF;
+    header[5] = (unsigned char)flag;
+    header[6] = header[0] ^ header[1] ^ header[2] ^ header[3] ^ header[4] ^ header[5];
+
+    if (nmg11(handle, (intptr_t)header, 7) != 7)
+        return 1;
+
+    /* Echo of the header checksum must match. */
+    if (bnQQ(handle, (intptr_t)&echo, 1) != 1 || echo != header[6])
+        return 1;
+
+    /* The framed data. */
+    if (bnQQ(handle, (intptr_t)buf, length) != length)
+        return 1;
+
+    /* Data checksum = XOR of every data byte. */
+    if (bnQQ(handle, (intptr_t)&data_checksum, 1) != 1)
+        return 1;
+
+    x = 0;
+    for (i = 0; i < length; i++)
+        x ^= buf[i];
+    if (data_checksum != x)
+        return 1;
+
+    return 0;
+}
+
+/* vN67: single 24-byte XTEA dongle transaction. Port of vN67 (liblumax.so).
+   Packet layout:
+     [0]   0xCD            (header byte)
+     [1..4] address        (4 bytes, little-endian)
+     [5]   command
+     [6]   hdr_checksum = address(4) ^ 0xCD ^ command
+     [7..22] write_buf     (16 bytes)
+     [23]  data_checksum = XOR(write_buf[0..15])
+   The card echoes the header checksum (1 byte, must match), then returns a
+   14-byte response; the 14th byte must equal XOR(response[0..12]) and the
+   13 payload bytes are copied into read_buf. 0 on success, 1 otherwise. */
+static int vN67(int handle, char command, int address, intptr_t write_buf, intptr_t read_buf)
+{
+    unsigned char packet[24];
+    unsigned char *wb = (unsigned char *)write_buf;
+    unsigned char *rb = (unsigned char *)read_buf;
+    unsigned char echo, data_checksum;
+    unsigned char response[14];
+    unsigned char x;
+    int i;
+
+    packet[0] = 0xCD;
+    packet[1] = address & 0xFF;
+    packet[2] = (address >> 8) & 0xFF;
+    packet[3] = (address >> 16) & 0xFF;
+    packet[4] = (address >> 24) & 0xFF;
+    packet[5] = (unsigned char)command;
+    packet[6] = packet[1] ^ packet[2] ^ packet[3] ^ packet[4] ^ packet[0] ^ packet[5];
+
+    data_checksum = 0;
+    for (i = 0; i < 16; i++) {
+        packet[7 + i] = wb ? wb[i] : 0;
+        data_checksum ^= packet[7 + i];
+    }
+    packet[23] = data_checksum;
+
+    if (nmg11(handle, (intptr_t)packet, 24) != 24)
+        return 1;
+
+    /* Echo of the header checksum must match. */
+    if (bnQQ(handle, (intptr_t)&echo, 1) != 1 || echo != packet[6])
+        return 1;
+
+    /* 14-byte response. */
+    if (bnQQ(handle, (intptr_t)response, 14) != 14)
+        return 1;
+
+    /* Response checksum = XOR of the first 13 bytes. */
+    x = 0;
+    for (i = 0; i < 13; i++)
+        x ^= response[i];
+    if (response[13] != x)
+        return 1;
+
+    if (rb)
+        memcpy(rb, response, 13);
+
+    return 0;
 }
 
 int clearBuffer(struct lumax_device *dev)
