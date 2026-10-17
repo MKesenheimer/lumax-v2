@@ -26,6 +26,7 @@ struct lumax_device {
     uint8_t  TTLAvailable;       // bit 0: card has TTL (from readID), bit 1: set via Lumax_SetTTL
     int      Flavor;             // color-channel layout (1/2/4/8/16)
     int      MaxPoints;          // max points per frame-buffer chunk (v10[36])
+    int      FrameCapacity;      // bytes per chunk buffer (v10[35] = 31500); MaxPoints = FrameCapacity/BytesPerPoint
     int      MaxScanSpeed;       // max scan speed (PPS) for this flavor (v10[51])
     uint32_t FrameDivisor;       // v10[324144] = 16000000; SendFrame frame-end divisor
     int      BytesPerPoint;      // v10[34]; bytes per point for the current flavor (7 for flavor 1)
@@ -88,9 +89,16 @@ int readFromDev(struct lumax_device *dev, uint8_t *buffer, uint32_t bytesToRead)
 
 int writeFrameBuffer(struct lumax_device *dev, uint8_t *frameBuffer, uint16_t frameBufferSize, uint16_t numberOfBytes, uint8_t counter, int flag);
 
+// Port of g4jz (liblumax.so): write [0xC9,0,0,0,0,0,0xC9], wait 50 ms, then
+// read the echo byte and classify: 1 byte present = basic card (no ID, the
+// 16-byte buffer is zeroed and it is a success); 18 bytes present = advanced
+// card (16 data bytes + 1 data checksum, verified by XOR). 0 on success.
 int readID(struct lumax_device *dev, uint8_t *arr, uint16_t size);
 
-int readMemory(struct lumax_device *dev, uint8_t *arr, uint16_t start, uint16_t end);
+// Port of wp8o (liblumax.so): write [0xCA, start_lo, start_hi, len_lo,
+// len_hi, 0, checksum] and read len+2 bytes (echo + data + data checksum).
+// 0 on success.
+int readMemory(struct lumax_device *dev, uint8_t *arr, uint16_t start, uint16_t len);
 
 // Set the blanking delay in milliseconds. At each off->on light transition
 // (laser turned on), this many ms worth of blank (laser-off) points are

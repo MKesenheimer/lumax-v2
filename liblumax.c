@@ -23,6 +23,7 @@ static int dev_read(struct lumax_device *dev, uint8_t *buf, int len);
 static int dev_read_available(struct lumax_device *dev);
 static int fvr(int handle, intptr_t dmx_buffer, unsigned short cmd, unsigned short length, char flag);
 static int vN67(int handle, char command, int address, intptr_t write_buf, intptr_t read_buf);
+static int Tj4(int handle, intptr_t buffer_ptr, unsigned short a3, unsigned short a4, char a5, int a6, int a7);
 
 /*
  * Debug tracing, enabled by setting LUMAX_DEBUG in the environment
@@ -70,11 +71,27 @@ static int num_detected_devices = 0;
 #define GHKR_FALLBACK_BUFFER_LAYOUT 1
 #define GHKR_FALLBACK_FLAVOR       1
 
-/* Fill any unset (0) config field from the ghrkr() fallback values. */
+/* Fill any unset (0) config field from the ghrkr() fallback values.
+ *
+ * Mirrors the per-slot defaults ghrkr() writes into m_38[] in liblumax.so:
+ *   slot[34] = 7         -> BytesPerPoint
+ *   slot[35] = 31500     -> FrameCapacity
+ *   slot[36] = 31500/7   -> MaxPoints
+ *   slot[49] = 1         -> Flavor
+ *   slot[51] = 45000     -> MaxScanSpeed (HJdd later raises this to 70000 for flavor 1)
+ *   slot[52] = 255       -> WaitGate
+ *   slot[324144] = 16000000 -> FrameDivisor
+ * Fields the reference does not pre-fill (BufferLayout) keep the port's
+ * BufferLayout fallback. Only 0-valued fields are touched, so real card
+ * values (applied later by HJdd/lumax_init_device) are never clobbered. */
 static void apply_fallback_config(struct lumax_device *dev)
 {
     if (!dev)
         return;
+    if (dev->FrameCapacity == 0)
+        dev->FrameCapacity = GHKR_FALLBACK_MAX_POINTS * 7; /* 31500 */
+    if (dev->BytesPerPoint == 0)
+        dev->BytesPerPoint = 7;
     if (dev->MaxPoints == 0)
         dev->MaxPoints = GHKR_FALLBACK_MAX_POINTS;
     if (dev->MaxScanSpeed == 0)
@@ -83,6 +100,10 @@ static void apply_fallback_config(struct lumax_device *dev)
         dev->BufferLayout = GHKR_FALLBACK_BUFFER_LAYOUT;
     if (dev->Flavor == 0)
         dev->Flavor = GHKR_FALLBACK_FLAVOR;
+    if (dev->WaitGate == 0)
+        dev->WaitGate = 255;
+    if (dev->FrameDivisor == 0)
+        dev->FrameDivisor = 16000000;
 }
 
 /*
@@ -270,166 +291,258 @@ int Lumax_OpenDevice(int PhysicalDevice, int Channel)
         return 0;
     }
 
-    /* Initialize the device structure for the open state */
-    struct lumax_device* openDev = &open_devices[num_open_devices];
-    memcpy(openDev, dev, sizeof(struct lumax_device));
-    openDev->ftdi = ftdi; /* Store the ftdi_context directly */
-    /* Ensure the dmx_state_byte is copied (it is part of the memcpy) */
+    /* Reference setup right after FT_OpenEx: FT_SetTimeouts(h,1000,1000) and
+     * FT_SetLatencyTimer(h,2). libftdi1 exposes the same knobs as context
+     * fields plus a setter. */
+    ftdi->usb_read_timeout = 1000;
+    ftdi->usb_write_timeout = 1000;
+    ftdi_set_latency_timer(ftdi, 2);
 
-    /* Initialize the device (reset, etc.) */
+    /* Register the device slot NOW (before the init handshake) so the handle
+     * is valid for the whole init. The reference stores the FTDI handle in the
+     * slot before P5555/g4jz/... so every nmg11/bnQQ resolves it; the final
+     * gate (StopFrame/SetDmxMode/SetTTL) are public handle-keyed functions and
+     * need the slot present too. On any init failure we roll this back. */
+    struct lumax_device *openDev = &open_devices[num_open_devices];
+    memset(openDev, 0, sizeof(*openDev));
+    memcpy(openDev->serial, dev->serial, sizeof(openDev->serial));
+    openDev->ftdi = ftdi;
+    openDev->numDev = num_open_devices + 1;   /* 1-based handle */
+    openDev->recovering = 0;
+
+    /* Per-card config, mirroring the reference's slot writes. The reset
+     * (P5555) and the HJdd/StopFrame/SetDmxMode/SetTTL gate all run against
+     * these; HJdd (in lumax_init_device) then finalizes BytesPerPoint /
+     * MaxPoints / MaxScanSpeed for the detected flavor. */
+    openDev->BufferLayout     = GHKR_FALLBACK_BUFFER_LAYOUT; /* slot[1204]=1 */
+    openDev->TTLBuffer        = 0;                           /* v10[32]    */
+    openDev->TTLAvailable     = 0;                           /* v10[31]    */
+    openDev->Flavor           = 1;                           /* v10[49]    */
+    openDev->FrameCapacity    = GHKR_FALLBACK_MAX_POINTS * 7;/* v10[35]=31500 */
+    openDev->MaxPoints        = GHKR_FALLBACK_MAX_POINTS;    /* v10[36] (HJdd overrides) */
+    openDev->MaxScanSpeed     = GHKR_FALLBACK_MAX_SCANSPEED; /* v10[51] (HJdd -> 70000)  */
+    openDev->BytesPerPoint    = 7;                           /* v10[34] (HJdd overrides) */
+    openDev->WaitGate         = 255;                         /* v10[52]    */
+    openDev->DmxFlavorMask    = 0;                           /* v10[50]    */
+    openDev->FrameDivisor     = 16000000;                    /* v10[324144]*/
+    openDev->dmx_state_byte   = 1;                           /* v10[324143]*/
+    openDev->NextLoopCounts   = 0;                           /* v10[42]    */
+    openDev->ScanSpeed        = 1000;                        /* v10[46]    */
+    openDev->LastDivisor      = 1000;                        /* v10[45]    */
+    openDev->NumberOfPoints   = 0;                           /* v10[47]    */
+    openDev->TimeUntilFree    = 0;
+    openDev->TimeOffset       = 0;
+    openDev->NumberOfFramesSend = 0;
+    openDev->IsBusy           = 0;
+    openDev->BusyTime         = 0;
+    num_open_devices++;
+    int handle = openDev->numDev;
+
+    /* Full open handshake: reset (P5555), readID (g4jz), [advanced-card
+     * config], HJdd flavor setup, then the reference's final gate — StopFrame,
+     * DMX off, TTL off — all driven through the now-valid handle. */
     if (lumax_init_device(openDev) != 0) {
         DBG("lumax_init_device failed");
+        ftdi_usb_close(ftdi);
         ftdi_free(ftdi);
+        openDev->ftdi = NULL;
+        num_open_devices--;   /* roll back the slot registration */
         return 0;
     }
 
-    /* Initialize the device state values */
-    /* BufferLayout/Flavor/MaxPoints/MaxScanSpeed were read from the card's
-     * memory by lumax_init_device() above. Don't zero them out; instead fill
-     * any that came back 0 from the ghrkr() fallbacks (see
-     * apply_fallback_config). This mirrors the .so, where the ghrkr() defaults
-     * are only overridden by the real card values. TTLBuffer/TTLAvailable are
-     * per-session state and are reset to 0 on each open. */
-    openDev->TTLBuffer = 0;
-    openDev->TTLAvailable = 0;
-    apply_fallback_config(openDev);
-    openDev->DmxFlavorMask = 0;
-    openDev->NextLoopCounts = 0;
-    openDev->TimeUntilFree = 0;
-    openDev->TimeOffset = 0;
-    openDev->NumberOfFramesSend = 0;
-    openDev->ScanSpeed = 0;
-    openDev->LastDivisor = 0;
-    openDev->NumberOfPoints = 0;
-    openDev->IsBusy = 0;
-    openDev->BusyTime = 0;
-
-    num_open_devices++;
-
-    /* Return handle (index+1) */
-    return num_open_devices; /* because we just incremented, so the index is num_open_devices-1, handle = index+1 = num_open_devices */
+    DBG("Lumax_OpenDevice: handle %d (serial %s, flavor %d, MaxPoints %d, BytesPerPoint %d, MaxScanSpeed %d)",
+        handle, openDev->serial, openDev->Flavor, openDev->MaxPoints,
+        openDev->BytesPerPoint, openDev->MaxScanSpeed);
+    return handle;
 }
 
 int Lumax_CloseDevice(int Handle)
 {
-    struct lumax_device* dev = find_open_device_by_handle(Handle);
+    struct lumax_device *dev = find_open_device_by_handle(Handle);
     if (!dev)
-        return 0;
+        return 1; /* invalid handle (reference: U9mp -> return 1) */
 
-    /* Close the libftdi1 handle */
+    int result;
     if (dev->ftdi) {
-        ftdi_usb_close(dev->ftdi);
+        /* reference: FT_Close(handle, 1) purges the RX buffer on close */
+        ftdi_usb_purge_buffers(dev->ftdi);
+        int rc = ftdi_usb_close(dev->ftdi);
         ftdi_free(dev->ftdi);
         dev->ftdi = NULL;
+        result = (rc == 0) ? 0 : 1; /* FT_Close returns 0 on success */
+    } else {
+        return 1; /* no open link (reference: v4[1]==0 -> return 1) */
     }
 
     /* Remove from open_devices array */
     int index = Handle - 1;
-    if (index < 0 || index >= num_open_devices)
-        return 0;
-
-    /* Shift remaining devices left */
-    int i;
-    for (i = index; i < num_open_devices - 1; i++) {
-        open_devices[i] = open_devices[i+1];
+    if (index >= 0 && index < num_open_devices) {
+        int i;
+        for (i = index; i < num_open_devices - 1; i++)
+            open_devices[i] = open_devices[i + 1];
+        num_open_devices--;
     }
-    num_open_devices--;
-
-    return 1;
+    return result;
 }
 
 int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanSpeed, int UpdateMode, int *TimeToWait)
 {
-    struct lumax_device* dev = find_open_device_by_handle(Handle);
-    if (!dev)
-        return 1; /* Device not valid */
+    (void)UpdateMode; /* the reference ignores this argument */
 
-    /* Handle default case: if NumOfPoints == 0, send a single point at center */
+    /* NumOfPoints == 0 -> a single "laser off at center" point at the
+       default 1000 PPS (this is what Lumax_StopFrame relies on). */
     if (NumOfPoints == 0) {
-        TLumax_Point default_point;
-        memset(&default_point, 0, sizeof(default_point));
-        default_point.Ch1 = 0x8000; /* Center X */
-        default_point.Ch2 = 0x8000; /* Center Y */
-        Points = &default_point;
+        static TLumax_Point def_point;
+        memset(&def_point, 0, sizeof(def_point));
+        def_point.Ch1 = 0x8000; /* center X */
+        def_point.Ch2 = 0x8000; /* center Y */
+        Points = &def_point;
         NumOfPoints = 1;
-        ScanSpeed = 1000; /* Default scan speed */
+        ScanSpeed = 1000;
     }
 
-    /* Validate number of points */
-    if (NumOfPoints <= 0 || NumOfPoints > 8 * dev->MaxPoints)
-        return 1; /* Invalid number of points */
+    struct lumax_device *dev = find_open_device_by_handle(Handle);
+    if (!dev || !dev->ftdi)
+        return 1;
 
-    /* Validate and limit scan speed */
-    if (ScanSpeed < 250)
-        ScanSpeed = 250; /* Minimum scan speed */
-    if (ScanSpeed > dev->MaxScanSpeed)
-        ScanSpeed = dev->MaxScanSpeed; /* Maximum scan speed for this flavor */
+    int max_points = dev->MaxPoints;
+    if (NumOfPoints <= 0 || 8 * max_points < NumOfPoints)
+        return 1;
 
-    /* Update device state counters */
+    /* Clamp scan speed to [250, MaxScanSpeed] */
+    int pps = ScanSpeed;
+    if (pps <= 249)
+        pps = 250;
+    if (pps > dev->MaxScanSpeed)
+        pps = dev->MaxScanSpeed;
+
+    /* Per-frame state (reference: v36[37..43]) */
     dev->NumberOfFramesSend++;
-    dev->ScanSpeed = ScanSpeed;
+    dev->NumberOfPoints = NumOfPoints;
+    dev->ScanSpeed = pps;
+    dev->TimeOffset = 0;
 
-    /* Calculate number of chunks (based on MaxPoints) */
-    int full_chunks = NumOfPoints / dev->MaxPoints;
-    int remainder_points = NumOfPoints % dev->MaxPoints;
-    int total_chunks = full_chunks + (remainder_points > 0 ? 1 : 0);
+    /* Chunk layout: the FIRST chunk carries the remainder, the rest carry
+       MaxPoints. total_chunks = ceil(NumOfPoints / MaxPoints). */
+    int total_chunks = NumOfPoints / max_points;
+    int remainder = NumOfPoints % max_points;
+    if (remainder)
+        total_chunks++;
 
-    /* Process each chunk */
+    int flavor = dev->Flavor;
     int point_index = 0;
-    for (int chunk = 0; chunk < total_chunks; chunk++) {
-        /* Determine size of this chunk */
-        int chunk_size = (chunk < full_chunks) ? dev->MaxPoints : remainder_points;
-        if (chunk_size == 0) continue;
 
-        /* Prepare buffer for this chunk */
-        /* Simplified conversion: take high 8 bits of each channel */
-        /* In a full implementation, this would vary by Flavor value */
-        unsigned char* buffer = malloc(chunk_size * 18); /* Max possible size: 9 shorts * 2 bytes each */
-        if (!buffer)
-            return 1; /* Memory allocation failed */
+    /* One packed chunk is at most MaxPoints * BytesPerPoint == FrameCapacity
+       bytes; a little slack covers any rounding. */
+    unsigned char *chunk = malloc(dev->MaxPoints * dev->BytesPerPoint + 16);
+    if (!chunk)
+        return 1;
 
-        int buf_pos = 0;
-        for (int i = 0; i < chunk_size; i++) {
-            TLumax_Point* p = &Points[point_index + i];
+    int tj_err = 0;
+    for (int c = 0; c < total_chunks; c++) {
+        int n_points = (c == 0) ? remainder : max_points;
+        int bp = 0;
 
-            /* Convert each channel to bytes (simplified: high byte only) */
-            /* Ch1-Ch8, TTL */
-            buffer[buf_pos++] = (p->Ch1 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch2 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch3 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch4 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch5 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch6 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch7 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->Ch8 >> 8) & 0xFF;
-            buffer[buf_pos++] = (p->TTL >> 8) & 0xFF;
+        for (int i = 0; i < n_points; i++) {
+            TLumax_Point *p = &Points[point_index + i];
+            unsigned int x = (p->Ch1 >> 4) & 0xFFF; /* 12-bit X */
+            unsigned int y = (p->Ch2 >> 4) & 0xFFF; /* 12-bit Y */
+
+            /* common 6-byte prefix */
+            chunk[bp++] = (unsigned char)((x >> 8) + 16 * (y >> 8));
+            chunk[bp++] = (unsigned char)(x & 0xFF);
+            chunk[bp++] = (unsigned char)(y & 0xFF);
+            chunk[bp++] = (unsigned char)(p->Ch3 >> 8); /* R hi */
+            chunk[bp++] = (unsigned char)(p->Ch4 >> 8); /* G hi */
+            chunk[bp++] = (unsigned char)(p->Ch5 >> 8); /* B hi */
+
+            /* flavor-specific suffix */
+            switch (flavor) {
+            case 1: /* 7 bytes: +TTL */
+                chunk[bp++] = (dev->TTLAvailable & 2) ? dev->TTLBuffer
+                                                      : (unsigned char)(p->TTL & 0xFF);
+                break;
+            case 2: /* 6 bytes: no suffix */
+                break;
+            case 4: /* 7 bytes: +Ch8 */
+                chunk[bp++] = (unsigned char)(p->Ch8 >> 8);
+                break;
+            case 8: /* 8 bytes: +Ch8 +Ch6 */
+                chunk[bp++] = (unsigned char)(p->Ch8 >> 8);
+                chunk[bp++] = (unsigned char)(p->Ch6 >> 8);
+                break;
+            case 16: /* 9 bytes: +Ch8 +Ch6 +Ch7 */
+                chunk[bp++] = (unsigned char)(p->Ch8 >> 8);
+                chunk[bp++] = (unsigned char)(p->Ch6 >> 8);
+                chunk[bp++] = (unsigned char)(p->Ch7 >> 8);
+                break;
+            default: /* unknown flavor: fall back to the 7-byte flavor-1 tail */
+                chunk[bp++] = (unsigned char)(p->TTL & 0xFF);
+                break;
+            }
         }
+        point_index += n_points;
 
-        /* Send the buffer to the device */
-        int written = nmg11(Handle, (intptr_t)buffer, buf_pos);
-        free(buffer);
+        DBG("SendFrame chunk %d: %d points, %d bytes, counter %d",
+            c, n_points, bp, dev->NextLoopCounts + c);
 
-        if (written != buf_pos)
-            return 1; /* Failed to write data */
-
-        /* Read response to verify */
-        unsigned char response[2];
-        int read_len = bnQQ(Handle, (intptr_t)response, 2);
-        if (read_len != 2 || response[0] != 0x01 || response[1] != 0x02) {
-            /* In a real implementation, we'd check for proper acknowledgment */
-            /* For now, we'll just continue on any response */
+        /* a3=0x8000 marks a frame-buffer write; a4=packed size; a5=chunk
+           counter; a6=0 -> Tj4 reads back 2 bytes [checksum, 0x55]. */
+        int r = Tj4(Handle, (intptr_t)chunk, 0x8000, (unsigned short)bp,
+                    (char)(dev->NextLoopCounts + c), 0, 0);
+        if (r) {
+            tj_err = r;
+            break;
         }
+    }
+    free(chunk);
+    if (tj_err)
+        return 1;
 
-        point_index += chunk_size;
+    /* Frame-end command (7 bytes): [3, rem_lo, rem_hi, div_lo, div_hi,
+       final_counter, checksum]; divisor = FrameDivisor / scan_speed. */
+    int divisor = dev->FrameDivisor / pps;
+    int final_counter = dev->NextLoopCounts + 16 * (total_chunks - 1);
+    unsigned char cmd[7];
+    cmd[0] = 3;
+    cmd[1] = (unsigned char)(remainder & 0xFF);
+    cmd[2] = (unsigned char)((remainder >> 8) & 0xFF);
+    cmd[3] = (unsigned char)(divisor & 0xFF);
+    cmd[4] = (unsigned char)((divisor >> 8) & 0xFF);
+    cmd[5] = (unsigned char)final_counter;
+    cmd[6] = (unsigned char)(cmd[0] ^ cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5]);
+
+    DBG("SendFrame frame-end: [3, rem=%d, div=%d, counter=%d, cks=0x%02x]",
+        remainder, divisor, final_counter, cmd[6]);
+
+    int ret = 1;
+    if (nmg11(Handle, (intptr_t)cmd, 7) == 7) {
+        unsigned char reply[4];
+        if (bnQQ(Handle, (intptr_t)reply, 4) == 4 && reply[0] == cmd[6]) {
+            if (reply[3] & 0x80) {
+                unsigned int tuf = reply[1]
+                    + max_points * ((reply[3] & 0x7F) - 1)
+                    + ((unsigned int)reply[2] << 8);
+                dev->TimeUntilFree = 1000 * tuf / pps;
+            } else {
+                dev->TimeUntilFree = 0;
+            }
+            dev->TimeOffset = 1000 * NumOfPoints / pps;
+            dev->LastDivisor = pps; /* v36[45] = v36[46] */
+            if (TimeToWait)
+                *TimeToWait = dev->TimeUntilFree;
+            ret = 0;
+        } else {
+            DBG("SendFrame frame-end reply mismatch: %02x %02x %02x %02x (want cks 0x%02x)",
+                reply[0], reply[1], reply[2], reply[3], cmd[6]);
+        }
+    } else {
+        DBG("SendFrame frame-end write failed");
     }
 
-    /* Update device state with last sent values */
-    dev->LastDivisor = ScanSpeed;
-    dev->NumberOfPoints = NumOfPoints;
-    dev->IsBusy = 1;
-    dev->BusyTime = 0; /* Would normally set to current time */
-
-    return 0; /* Success */
+    /* Toggle the chunk counter 0 <-> 8 between frames. */
+    dev->NextLoopCounts = (dev->NextLoopCounts != 0) ? 0 : 8;
+    return ret;
 }
 
 int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferChanged)
@@ -438,9 +551,10 @@ int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferCha
     if (!dev)
         return 1; /* Device not valid */
 
-    /* Check if device reports busy time (bit 3 of TimeUntilFree) */
-    if ((dev->TimeUntilFree & 8) == 0)
-        return 0; /* Device not busy or no timeout info */
+    /* Gate (reference v25[52] & 8): WaitGate is 255 for a live card, so bit 3
+       is set and we query the card. A closed/zeroed slot would return 0 here. */
+    if ((dev->WaitGate & 8) == 0)
+        return 0;
 
     unsigned char cmd_buf[7];
     unsigned char response_buf[10]; /* Enough for max response */
@@ -534,23 +648,12 @@ int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferCha
 
 int Lumax_StopFrame(int Handle)
 {
-    /* Stop frame: send command to halt laser output
-       Sets all color channels to 0, positions X/Y to center, disables TTL outputs */
-    uint8_t cmd_buf[3];
-    cmd_buf[0] = 20;           /* Command code for stop frame */
-    cmd_buf[1] = 0;            /* X position high byte */
-    cmd_buf[2] = 0;            /* Y position high byte */
-
-    /* Send the stop command to the device */
-    if (nmg11(Handle, (intptr_t)cmd_buf, 3) != 3)
-        return 0;
-
-    /* Read back response to verify */
-    uint8_t response_buf[10];
-    if (bnQQ(Handle, (intptr_t)response_buf, 1) != 1)
-        return 0;
-
-    return 1;
+    /* Reference: a "stop" is just a single blank point at center plus a
+       2-second buffer wait, so the laser goes dark and the card settles. */
+    int r = Lumax_SendFrame(Handle, NULL, 0, 0, 0, NULL);
+    if (r)
+        return r;
+    return Lumax_WaitForBuffer(Handle, 2000, NULL, NULL);
 }
 
 int Lumax_SetTTL(int Handle, int TTL)
@@ -564,14 +667,14 @@ int Lumax_SetTTL(int Handle, int TTL)
     if (U9mp(Handle))
         return 1; /* Device not valid */
 
-    /* Prepare command: [0x30, TTL, 0, 0, 0, 0, 0] */
-    cmd_buf[0] = 0x30;           /* Command code for Set TTL */
-    cmd_buf[1] = (uint8_t)TTL;   /* TTL value to set */
+    /* Prepare command: [0x1E, TTL, 0, 0, 0, 0, TTL^0x1E] */
+    cmd_buf[0] = 0x1E;                    /* command code for Set TTL */
+    cmd_buf[1] = (uint8_t)TTL;            /* TTL value to set */
     cmd_buf[2] = 0;
     cmd_buf[3] = 0;
     cmd_buf[4] = 0;
     cmd_buf[5] = 0;
-    cmd_buf[6] = 0;
+    cmd_buf[6] = (uint8_t)(TTL ^ 0x1E);   /* trailing checksum */
 
     /* Send the command to the device */
     if (nmg11(Handle, (intptr_t)cmd_buf, 7) != 7)
@@ -967,113 +1070,140 @@ int openDevBySerial(const char *serial, struct lumax_device *dev)
     return 0;
 }
 
+/* Port of HJdd (liblumax.so): finalize the point geometry for the active
+ * flavor. v10 = DmxFlavorMask (0 for a basic card -> treated as 1).
+ * flavor = Flavor & mask. Per flavor, BytesPerPoint and MaxScanSpeed are fixed
+ * and MaxPoints = FrameCapacity / BytesPerPoint. For a basic card (mask 0)
+ * this is a pure computation with no USB I/O; for a Bare-Lumax card (mask
+ * non-zero) the reference also sends a 7-byte flavor command (gKTU + a framed
+ * header + 2-byte verify), which this port does not model. 0 on success. */
+static int hjdd(struct lumax_device *dev)
+{
+    if (!dev)
+        return 1;
+    int mask = dev->DmxFlavorMask ? dev->DmxFlavorMask : 1;
+    int flavor = dev->Flavor & mask;
+    int bytes_per_point = 0;
+    int max_scanspeed = 0;
+    if (flavor == 1)      { bytes_per_point = 7; max_scanspeed = 70000; }
+    else if (flavor == 2) { bytes_per_point = 6; max_scanspeed = 70000; }
+    else if (flavor == 4) { bytes_per_point = 7; max_scanspeed = 65000; }
+    else if (flavor == 8) { bytes_per_point = 8; max_scanspeed = 55000; }
+    else if (flavor == 16){ bytes_per_point = 9; max_scanspeed = 45000; }
+    else
+        return 1;
+    int max_points = dev->FrameCapacity / bytes_per_point;
+    if (max_points <= 0)
+        return 1;
+    if (dev->DmxFlavorMask) {
+        /* Bare-Lumax flavor command not modelled in this port. */
+        return 1;
+    }
+    dev->Flavor = flavor;
+    dev->BytesPerPoint = bytes_per_point;
+    dev->MaxPoints = max_points;
+    dev->MaxScanSpeed = max_scanspeed;
+    return 0;
+}
+
+/* Port of the reference open handshake. liblumax.so runs all of this inside
+ * Lumax_OpenDevice (there is no separate init function): after FT_OpenEx and
+ * the timeout/latency setup it does P5555 (reset), g4jz (readID), an
+ * advanced-card block (wp8o readMemory + dongle + fvr), and then the final
+ * gate HJdd/StopFrame/SetDmxMode/SetTTL. The slot is registered before any of
+ * it, so the handle-keyed calls in the gate resolve. This port factors the
+ * same sequence out so it is also reusable by busy-recovery. Returns 0 on
+ * full success, -1 otherwise. */
 int lumax_init_device(struct lumax_device *dev)
 {
     if (!dev || !dev->ftdi)
         return -1;
 
-    int result;
-    int i;
+    int handle = dev->numDev;
+    int r;
 
-    /* 1. Reset the per-card state */
-    /* Based on analysis, this sends 256 zero bytes with "GNU" string */
-    unsigned char reset_buf[259]; /* 256 zeros + "GNU" (3 bytes) */
-    memset(reset_buf, 0, 256);
-    reset_buf[256] = 'G';
-    reset_buf[257] = 'N';
-    reset_buf[258] = 'U';
-
-    int written = ftdi_write_data(dev->ftdi, reset_buf, 259);
-    DBG("init step1 reset write = %d (expect 259)", written);
-    if (written != 259) {
-        return -1; /* Failed to write reset sequence */
+    /* 1. P5555 reset: 256 zero-bytes, 256 times = 65536 zeros, then 200 ms
+     * settle, then purge RX+TX. (In the decompilation the write amount 0x100
+     * was mislabelled as the "GNU" string pointer; the payload is all zeros.) */
+    unsigned char zbuf[256];
+    memset(zbuf, 0, sizeof(zbuf));
+    int wr_total = 0;
+    int rep;
+    for (rep = 0; rep < 256; rep++) {
+        int w = ftdi_write_data(dev->ftdi, zbuf, 256);
+        if (w < 0) {
+            DBG("init P5555 reset write rep %d failed: %d", rep, w);
+            return -1;
+        }
+        wr_total += w;
     }
+    DBG("init P5555 reset wrote %d bytes (expect 65536)", wr_total);
+    usleep(200000);                 /* 200 ms settle, matches reference */
+    ftdi_usb_purge_buffers(dev->ftdi);
 
-    /* Small delay after reset */
-    usleep(10000); /* 10ms */
-
-    /* 2. Clear buffer */
-    result = clearBuffer(dev);
-    DBG("init step2 clearBuffer = %d (expect 1)", result);
-    if (result != 1) {
-        return -1; /* Failed to clear buffer */
-    }
-
-    /* 3. ReadID */
-    unsigned char id_buffer[16];
-    result = readID(dev, id_buffer, 16);
-    DBG("init step3 readID = %d", result);
-    for (i = 0; i < result && i < 16; i++)
-        DBG("  id[%d]=0x%02x", i, id_buffer[i]);
-    if (result < 0) {
-        return -1; /* Failed to read ID */
-    }
-    /* Extract serial number from ID if needed */
-    if (dev->serial[0] == '\0' && result >= 8) {
-        /* Assuming serial is in first 8 bytes of ID response */
-        memcpy(dev->serial, id_buffer, 8);
-        dev->serial[8] = '\0'; /* Null terminate */
+    /* 2. g4jz readID. A basic card answers with only the 0xC9 echo (1 byte in
+     * the queue) -> success with a zeroed id. An advanced card answers with
+     * 18 bytes (echo + 16 data + checksum). On transport failure the reference
+     * simply skips the id block and still reaches the final gate; we do the
+     * same (treat as basic) rather than failing the open. */
+    uint8_t id[16];
+    memset(id, 0, sizeof(id));
+    r = readID(dev, id, 16);
+    DBG("init g4jz readID = %d (0=basic/ok, 1=fail)", r);
+    if (r != 0) {
+        DBG("  readID failed; treating as a basic card");
+    } else {
+        int i;
+        for (i = 0; i < 16; i++)
+            DBG("  id[%d]=0x%02x", i, id[i]);
     }
 
-    /* 4. ReadMemory */
-    unsigned char mem_buffer[64];
-    result = readMemory(dev, mem_buffer, 0, 63);
-    DBG("init step4 readMemory = %d", result);
-    if (result >= 8) {
-        for (i = 0; i < result && i < 16; i++)
-            DBG("  mem[%d]=0x%02x", i, mem_buffer[i]);
-    }
-    if (result < 0) {
-        return -1; /* Failed to read memory */
-    }
-    /* Extract configuration from memory */
-    if (result >= 8) {
-        dev->BufferLayout = mem_buffer[0] & 0x0F;
-        dev->TTLBuffer = mem_buffer[1] & 0x7F;
-        dev->TTLAvailable = (mem_buffer[2] & 0x01) | ((mem_buffer[3] & 0x01) << 1);
-        dev->Flavor = 1 << (mem_buffer[4] & 0x0F); /* 1,2,4,8,16 */
-        dev->MaxPoints = 256 * (mem_buffer[5] & 0x0F);
-        dev->MaxScanSpeed = 100 * (mem_buffer[6] & 0x0F);
-        dev->DmxFlavorMask = (mem_buffer[7] << 8) | mem_buffer[6];
+    /* 3. Advanced-card config (only when id[4] > 6). The connected card is
+     * basic (id[4]==0) so this branch is not taken; it is kept for fidelity.
+     * wp8o reads 15 bytes of card memory; a read failure invalidates the open
+     * in the reference (v10[1]=0). */
+    if (r == 0 && id[4] > 6) {
+        dev->dmx_state_byte = 5;    /* reference: v10[324143] = 5 for advanced */
+        uint8_t mem[16];
+        if (readMemory(dev, mem, 0, 15) != 0) {
+            DBG("init wp8o readMemory (advanced) failed");
+            return -1;
+        }
+        /* The reference then performs the dongle exchange (Lumax_DongleCom cmd
+         * 1) and, for id[4] 9..11, applies the card's flavor/mask/waitgate and
+         * (for id[4] > 10) re-derives the frame divisor. That memory layout is
+         * not modelled in this port; HJdd below still finalizes the point
+         * geometry for whatever Flavor is set. */
+        DBG("init: advanced card (id[4]=%d); flavor config left to HJdd", id[4]);
     }
 
-    /* 5. Dongle exchange + flavor key */
-    /* Dongle exchange */
-    unsigned char dongle_write[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
-    unsigned char dongle_read[8];
-    result = dongleCom(dev, 0x01, 0x0000, dongle_write, dongle_read);
-    DBG("init step5 dongleCom = %d (expect 1)", result);
-    if (result != 1) {
-        return -1; /* Dongle exchange failed */
+    /* 4. HJdd: finalize BytesPerPoint / MaxPoints / MaxScanSpeed / Flavor for
+     * the (basic) flavor. For a basic card (DmxFlavorMask==0) this is a pure
+     * computation with no USB I/O. */
+    if (hjdd(dev) != 0) {
+        DBG("init HJdd(flavor=%d) failed", dev->Flavor);
+        return -1;
     }
+    DBG("init HJdd done: flavor=%d BytesPerPoint=%d MaxPoints=%d MaxScanSpeed=%d",
+        dev->Flavor, dev->BytesPerPoint, dev->MaxPoints, dev->MaxScanSpeed);
 
-    /* Flavor key */
-    result = sendKey(dev, dev->Flavor);
-    DBG("init step5b sendKey(flavor=%d) = %d (expect 1)", dev->Flavor, result);
-    if (result != 1) {
-        return -1; /* Failed to send flavor key */
-    }
+    /* 5. Reference final gate: StopFrame, DMX off, TTL off. All must succeed
+     * (each returns 0 on success). StopFrame == SendFrame(0 points) +
+     * WaitForBuffer(2000 ms). */
+    r = Lumax_StopFrame(handle);
+    DBG("init StopFrame = %d (expect 0)", r);
+    if (r != 0)
+        return -1;
 
-    /* 6. Stop frame */
-    result = Lumax_StopFrame(0); /* Handle 0 means use current device context */
-    DBG("init step6 Lumax_StopFrame(0) = %d (expect 1)", result);
-    if (result != 1) {
-        return -1; /* Stop frame failed */
-    }
+    r = Lumax_SetDmxMode(handle, 0, 0);
+    DBG("init SetDmxMode(0,0) = %d (expect 0)", r);
+    if (r != 0)
+        return -1;
 
-    /* 7. DMX off */
-    result = Lumax_SetDmxMode(0, 0, 0);
-    DBG("init step7 Lumax_SetDmxMode(0,0,0) = %d (expect 1)", result);
-    if (result != 1) {
-        return -1; /* Failed to turn DMX off */
-    }
-
-    /* 8. TTL off */
-    result = Lumax_SetTTL(0, 0);
-    DBG("init step8 Lumax_SetTTL(0,0) = %d (expect 1)", result);
-    if (result != 1) {
-        return -1; /* Failed to turn TTL off */
-    }
+    r = Lumax_SetTTL(handle, 0);
+    DBG("init SetTTL(0) = %d (expect 0)", r);
+    if (r != 0)
+        return -1;
 
     return 0; /* Success */
 }
@@ -1399,50 +1529,104 @@ int writeFrameBuffer(struct lumax_device *dev, uint8_t *frameBuffer, uint16_t fr
 
 int readID(struct lumax_device *dev, uint8_t *arr, uint16_t size)
 {
-    if (!dev || !dev->ftdi || !arr || size == 0)
-        return 0;
+    if (!dev || !dev->ftdi || !arr || size < 16)
+        return 1;
 
-    /* Read device ID command */
-    /* Based on analysis, this is likely a specific command to read device ID */
-    unsigned char cmd[2] = {0x15, 0x00}; /* Example ID read command */
+    /* g4jz: write [0xC9, 0,0,0,0,0, 0xC9], wait 50 ms, then classify the
+       response. A basic card answers with only the 0xC9 echo (1 byte); an
+       advanced card sends 18 bytes (echo + 16 data + 1 data checksum). */
+    unsigned char cmd[7] = {0xC9, 0, 0, 0, 0, 0, 0xC9};
+    if (dev_write(dev, cmd, 7))
+        return 1;
 
-    if (nmg11(0, (intptr_t)cmd, 2) != 2) {
-        /* Try direct write */
-        int written = ftdi_write_data(dev->ftdi, cmd, 2);
-        if (written != 2)
-            return 0;
+    usleep(50000); /* 50 ms, matches reference */
+
+    /* Drain everything the card has sent (echo and data arrive as separate
+       USB packets, so read repeatedly until the pipe runs dry, up to 18). */
+    unsigned char acc[18];
+    int total = 0;
+    int save_to = dev->ftdi->usb_read_timeout;
+    dev->ftdi->usb_read_timeout = 120; /* short: catch what is ready */
+    for (;;) {
+        int r = ftdi_read_data(dev->ftdi, acc + total, 18 - total);
+        if (r <= 0)
+            break;
+        total += r;
+        if (total >= 18)
+            break;
+    }
+    dev->ftdi->usb_read_timeout = save_to;
+
+    if (total <= 0)
+        return 1;
+    if (acc[0] != 0xC9) { /* echo mismatch */
+        DBG("readID: echo 0x%02x != 0xC9", acc[0]);
+        return 1;
     }
 
-    /* Read the ID response */
-    int read_len = ftdi_read_data(dev->ftdi, arr, size);
-    return (read_len >= 0) ? read_len : 0;
+    if (total == 1) {
+        /* Basic card: no ID block. Zero the 16-byte buffer, report success. */
+        memset(arr, 0, 16);
+        DBG("readID: basic card (echo only)");
+        return 0;
+    }
+
+    if (total < 18) {
+        DBG("readID: expected 18 bytes, got %d", total);
+        return 1;
+    }
+
+    /* Advanced card: 16 data bytes (acc[1..16]) + 1 checksum (acc[17]). */
+    int x = 0;
+    for (int i = 0; i < 16; i++) {
+        arr[i] = acc[1 + i];
+        x ^= arr[i];
+    }
+    if (x != acc[17]) {
+        DBG("readID: data xor 0x%02x != checksum 0x%02x", x, acc[17]);
+        return 1;
+    }
+    DBG("readID: advanced card, id[4]=0x%02x", arr[4]);
+    return 0;
 }
 
-int readMemory(struct lumax_device *dev, uint8_t *arr, uint16_t start, uint16_t end)
+int readMemory(struct lumax_device *dev, uint8_t *arr, uint16_t start, uint16_t len)
 {
-    if (!dev || !dev->ftdi || !arr || start > end)
-        return 0;
+    if (!dev || !dev->ftdi || !arr)
+        return 1;
+    if (start < 0 || len <= 0 || start + len > 400)
+        return 1;
 
-    /* Read memory command */
-    /* Based on analysis, this sends start and end addresses */
-    unsigned char cmd[5];
-    cmd[0] = 0x14; /* Memory read command */
+    /* wp8o: write [0xCA, start_lo, start_hi, len_lo, len_hi, 0, checksum] and
+       read len+2 bytes (echo checksum + data + data checksum). */
+    unsigned char cmd[7];
+    cmd[0] = 0xCA;
     cmd[1] = start & 0xFF;
     cmd[2] = (start >> 8) & 0xFF;
-    cmd[3] = end & 0xFF;
-    cmd[4] = (end >> 8) & 0xFF;
+    cmd[3] = len & 0xFF;
+    cmd[4] = (len >> 8) & 0xFF;
+    cmd[5] = 0;
+    cmd[6] = (unsigned char)(cmd[0] ^ cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5]);
 
-    if (nmg11(0, (intptr_t)cmd, 5) != 5) {
-        /* Try direct write */
-        int written = ftdi_write_data(dev->ftdi, cmd, 5);
-        if (written != 5)
-            return 0;
+    if (dev_write(dev, cmd, 7))
+        return 1;
+
+    unsigned char rx[400 + 2];
+    if (dev_read(dev, rx, len + 2))
+        return 1;
+
+    int x = 0;
+    for (int i = 0; i < len; i++) {
+        arr[i] = rx[1 + i];
+        x ^= arr[i];
     }
-
-    /* Read the memory data */
-    uint16_t length = end - start + 1;
-    int read_len = ftdi_read_data(dev->ftdi, arr, length);
-    return (read_len >= 0) ? read_len : 0;
+    if (rx[0] != cmd[6] || rx[len + 1] != (unsigned char)x) {
+        DBG("readMemory: echo 0x%02x (want 0x%02x), data xor 0x%02x (want 0x%02x)",
+            rx[0], cmd[6], rx[len + 1], x);
+        return 1;
+    }
+    DBG("readMemory: start=%d len=%d ok", start, len);
+    return 0;
 }
 
 void Lumax_SetBlankingDelay(int delay_ms)
@@ -1505,7 +1689,7 @@ int dongleCom(struct lumax_device *dev, uint8_t flag, uint32_t address, uint8_t 
 
 /* Helper function reverse engineered from Tj4 in liblumax.so */
 /* Helper function reverse engineered from Tj4 in liblumax.so */
-static int Tj4(int handle, int buffer_ptr, unsigned short a3, unsigned short a4, char a5, int a6, int a7)
+static int Tj4(int handle, intptr_t buffer_ptr, unsigned short a3, unsigned short a4, char a5, int a6, int a7)
 {
     struct lumax_device* dev = find_open_device_by_handle(handle);
     if (!dev)
