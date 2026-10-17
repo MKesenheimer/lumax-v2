@@ -17,6 +17,10 @@
 static int U9mp(int handle);
 static int nmg11(int handle, intptr_t buffer, int length);
 static int bnQQ(int handle, intptr_t buffer, int length);
+/* device-pointer-based I/O used by lumax_init_device (before handle is valid) */
+static int dev_write(struct lumax_device *dev, const uint8_t *buf, int len);
+static int dev_read(struct lumax_device *dev, uint8_t *buf, int len);
+static int dev_read_available(struct lumax_device *dev);
 static int fvr(int handle, intptr_t dmx_buffer, unsigned short cmd, unsigned short length, char flag);
 static int vN67(int handle, char command, int address, intptr_t write_buf, intptr_t read_buf);
 
@@ -1126,6 +1130,46 @@ static int bnQQ(int handle, intptr_t buffer, int length)
         return -1;
     }
     return read_len;
+}
+
+/* ---- Device-pointer-based low-level I/O ----
+ *
+ * The handle-keyed nmg11/bnQQ resolve the device through
+ * find_open_device_by_handle(), which is only valid once a slot has been
+ * added to open_devices[]. But lumax_init_device() runs *before* the slot is
+ * registered (Lumax_OpenDevice increments num_open_devices only after init
+ * succeeds), so the init path drives these dev->ftdi-based primitives
+ * directly. They mirror the reference .so's nmg11/bnQQ, which also return
+ * 0 on success / 1 on failure.
+ */
+static int dev_write(struct lumax_device *dev, const uint8_t *buf, int len)
+{
+    if (!dev || !dev->ftdi)
+        return 1;
+    return (ftdi_write_data(dev->ftdi, buf, len) == len) ? 0 : 1;
+}
+
+static int dev_read(struct lumax_device *dev, uint8_t *buf, int len)
+{
+    if (!dev || !dev->ftdi)
+        return 1;
+    return (ftdi_read_data(dev->ftdi, buf, len) == len) ? 0 : 1;
+}
+
+/* Emulates FT_GetQueueStatus (the .so's LUO2): returns the number of bytes
+ * currently sitting in the RX buffer without waiting for more. libftdi1 has
+ * no direct equivalent, so we poll with a 0ms (non-blocking) read. The caller
+ * must restore ftdi->usb_read_timeout afterwards (readID does this). */
+static int dev_read_available(struct lumax_device *dev)
+{
+    unsigned char b;
+    if (!dev || !dev->ftdi)
+        return 0;
+    int save = dev->ftdi->usb_read_timeout;
+    dev->ftdi->usb_read_timeout = 0;
+    int n = ftdi_read_data(dev->ftdi, &b, 1);
+    dev->ftdi->usb_read_timeout = save;
+    return (n > 0) ? 1 : 0;
 }
 
 /* fvr: receive a framed block from the card (DMX). Port of fvr (liblumax.so).

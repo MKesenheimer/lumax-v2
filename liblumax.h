@@ -25,8 +25,11 @@ struct lumax_device {
     uint8_t  TTLBuffer;          // global TTL value sent with every point
     uint8_t  TTLAvailable;       // bit 0: card has TTL (from readID), bit 1: set via Lumax_SetTTL
     int      Flavor;             // color-channel layout (1/2/4/8/16)
-    int      MaxPoints;          // max points per frame-buffer chunk
-    int      MaxScanSpeed;       // max scan speed (PPS) for this flavor
+    int      MaxPoints;          // max points per frame-buffer chunk (v10[36])
+    int      MaxScanSpeed;       // max scan speed (PPS) for this flavor (v10[51])
+    uint32_t FrameDivisor;       // v10[324144] = 16000000; SendFrame frame-end divisor
+    int      BytesPerPoint;      // v10[34]; bytes per point for the current flavor (7 for flavor 1)
+    uint32_t WaitGate;           // v10[52] = 255; the bit-3 gate WaitForBuffer checks
     uint32_t DmxFlavorMask;      // non-zero only on Bare-Lumax cards
 
     // per-card frame / timing state

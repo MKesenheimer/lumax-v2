@@ -4,7 +4,6 @@
 This project involves reversing the Lumax DLL (`lumax.dll`) which controls Lumax laser show controllers via USB using FTDI chips. The DLL provides functions for device enumeration, opening/closing devices, sending laser frames, configuring TTL outputs, DMX512 communication, and more.
 
 ## Directory Contents
-
 - `Example_VB/`: A Visual Basic 6 example project demonstrating how to use the Lumax DLL.
   - Contains `lumax.dll` (the library to reverse), `Lumax_dll.bas` (API declarations), `Form1.frm`, `Global.bas`, and a compiled example executable `Beispiel_Lumax_VB.exe`.
   - The example shows how to enumerate devices, open handles, send laser frames (drawing a circle), and handle device closing.
@@ -16,13 +15,11 @@ This project involves reversing the Lumax DLL (`lumax.dll`) which controls Lumax
   - Includes `ftd2xx.h`, DLLs (`ftd2xx.dll`, `ftlang.dll`, etc.), driver `.sys` and `.inf` files, and release documentation.
 
 ## Additional Files Provided
-
 - `lumax.h`: C header with API definitions and TLumax_Point struct.
 - `liblumax.h`: Internal header with helper functions and device structure.
 - `main.c`: Simple test program demonstrating usage.
 
 ## API Documentation (from Lumax_dll.bas)
-
 The Lumax DLL exports the following functions (as declared in Visual Basic):
 
 - `Lumax_GetApiVersion()` → Returns DLL version number (Integer)
@@ -43,7 +40,6 @@ The Lumax DLL exports the following functions (as declared in Visual Basic):
 - `LumaxDatenfeld(0 To 20000) As tLumax_Punkt`: Array to hold up to 20001 points for a frame.
 
 ## Function Inventory
-
 Based on analysis of `lumax.dll` exports and header files, the following functions are part of the Lumax API:
 
 ### Exported API Functions
@@ -119,10 +115,22 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 - We have analyzed and implemented `Lumax_SendDmx` (reverse-engineered shows it transmits DMX512 data via Tj4 helper function; implemented as a wrapper around Tj4 with appropriate parameters).
 - We have implemented the device initialization sequence in `lumax_init_device` that includes reset, buffer clearing, ID reading, memory reading, dongle exchange, flavor key transmission, stop frame, DMX off, and TTL off.
 - We have implemented all internal helper functions from liblumax.h: openDev, openDevBySerial, lumax_init_device, clearBuffer, checkIfBusy, isOpen, sendInitKey, sendKey, writeToDev, readFromDev, writeFrameBuffer, readID, readMemory, Lumax_SetBlankingDelay, dongleCom.
-- Remaining functions to implement or analyze: `Lumax_ReceiveDmx`, `Lumax_Dongle_XTEA_Com`, `Lumax_ExchangeDevInfo`, `Lumax_SetDacValue`.
+- We have analyzed and implemented the four remaining API functions (verified against both `liblumax.so` on port 13337 and `lumax.dll` on port 13338):
+  - `Lumax_ReceiveDmx` — DMX receive via the new `fvr` helper: a 7-byte header `[2, cmd(0xFB0C) LE, length LE, flag, checksum]` (checksum = XOR of the six header bytes) is sent; the card echoes the checksum, streams the data bytes, then a data checksum (XOR of all data bytes) is verified. Validated for `0 < Length <= 1025`.
+  - `Lumax_Dongle_XTEA_Com` and `Lumax_DongleCom` — dongle (XTEA copy-protection) communication. The low-level 24-byte packet primitive is the new `vN67` helper (`[0xCD, address(4 LE), cmd, hdr_checksum, write(16), data_checksum]`); on top of it, `dongleRawCom` ports the raw-command layer (`Lumax_DongleCom` in the .so / `sub_4061D4` in the .dll) that interprets the response status byte (byte 12) into 2xx error codes (201/202/203/204/205/206) and copies the command-specific response words. `Lumax_Dongle_XTEA_Com` maps the public 1-9 commands onto the raw set (1→1, 2→90, 3→129, 4→131, 5→130, 6→133, 7→134, 8→132, 9→85) and additionally remaps command 1's one-byte answer (1→2, 2→1, 254→3).
+  - `Lumax_SetDacValue` — a no-op that unconditionally returns 1, matching the reference (`lumax.dll` `Lumax_SetDacValue` is `return 1;`).
+  - `Lumax_ExchangeDevInfo` — kept as a documented stub: in `lumax.dll` it is tightly bound to the obfuscated per-device `Block` struct (a marker write plus a version/features read-back) that is not modelled 1:1 in this port, so it validates its inputs and returns 1 ("not supported").
+- We have implemented `ghrkr` (the one-time lazy global constructor, guarded like the .so's `Constructor_State`). In `liblumax.so` it `malloc`s the ~10.6 MB `m_38[]` array and, for each of the 8 device slots, writes fallback config (chunk size field 1191 = 31500/7 = 4500, max scan speed field 1206 = 45000, buffer layout field 1204 = 1) plus the per-flavor scan-speed preset tables. This port keeps its device records in the static `open_devices[]`/`detected_devices[]` arrays (no malloc) and does not model the preset tables (`writeFrameBuffer` is a raw `ftdi_write_data`), so `ghrkr` reduces to: apply `apply_fallback_config()` to the open-device slots once. The fallbacks are what `Lumax_SendFrame` needs to stay safe (it divides by `MaxPoints` and clamps to `MaxScanSpeed`); `lumax_init_device` overrides them from the card's memory read, and `Lumax_OpenDevice` now calls `apply_fallback_config` after init rather than zeroing the config (previously it clobbered `MaxPoints`/`MaxScanSpeed`/`BufferLayout` back to 0, which made `SendFrame` reject every frame).
 - The library now successfully builds as a shared library (liblumax.dylib on macOS) using pkg-config to manage FTDI and USB library dependencies.
 - Focus on how the DLL interacts with the FTDI driver (`ftd2xx.dll`) to perform USB I/O.
 - Examine the frame sending process, buffer handling, and device initialization sequence.
 - Consider the safety features (e.g., emergency stop via `Lumax_StopFrame`) and how they are implemented.
 - Utilize the IDA Pro MCP servers running on ports 13337 and 13338 for advanced reverse engineering analysis.
 - Check availability of MCP server with `curl -s http://127.0.0.1:13337/config.html 2>/dev/null || echo "IDA Pro MCP server not available"` or `curl -s http://127.0.0.1:13338/config.html 2>/dev/null || echo "IDA Pro MCP server not available"`. Don't use endpoint `/health`, as it does not exist.
+
+## Stream Timeout Prevention
+1. Do each numbered task ONE AT A TIME. Complete one task fully, confirm it worked, then move to the next.
+2. Never write a file longer than ~150 lines in a single tool call. If a file will be longer, write it in multiple append/edit passes.
+3. Start a fresh session if the conversation gets long (20+ tool calls). The error gets worse as the session grows.
+4. Keep individual grep/search outputs short. Use flags like `--include` and `-l` (list files only) to limit output size.
+5. If you do hit the timeout, retry the same step in a shorter form. Don't repeat the entire task from scratch.
