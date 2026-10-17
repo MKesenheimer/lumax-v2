@@ -103,34 +103,44 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 7. To stop output, call `Lumax_StopFrame(handle)`.
 8. When finished, call `Lumax_CloseDevice(handle)` for each opened device.
 
-## Next Steps for Reverse Engineering
-- We have created a stub library (`liblumax.c`) that now successfully compiles and links with libftdi1, including actual libftdi1 read/write operations in the helper functions.
-- We have analyzed and implemented `Lumax_GetApiVersion` (returns 207), `Lumax_GetPhysicalDevices` (enumerates Lumax devices via libftdi1), `Lumax_OpenDevice` (opens a device and returns a handle), and `Lumax_CloseDevice` (closes a device).
-- We have analyzed `Lumax_GetDeviceInfo` (reverse-engineered shows it queries device information from internal structures; kept as stub returning 0 as it's reserved for future developments).
-- We have analyzed and implemented `Lumax_SetTTL` (reverse-engineered shows it sets TTL outputs via command/response verification; implemented using libftdi1).
-- We have analyzed and implemented `Lumax_StopFrame` (reverse-engineered shows it halts laser output via command/response; implemented using libftdi1).
-- We have analyzed and implemented `Lumax_WaitForBuffer` (reverse-engineered shows it waits for buffer status via command/response; implemented using libftdi1).
-- We have analyzed and implemented `Lumax_SendFrame` (reverse-engineered shows it formats and sends laser point data to the device; implemented using libftdi1).
-- We have analyzed and implemented `Lumax_SetDmxMode` (reverse-engineered shows it activates/deactivates DMX512 sender/receiver via command/response; implemented using libftdi1).
-- We have analyzed and implemented `Lumax_SendDmx` (reverse-engineered shows it transmits DMX512 data via Tj4 helper function; implemented as a wrapper around Tj4 with appropriate parameters).
-- We have implemented the device initialization sequence in `lumax_init_device` that includes reset, buffer clearing, ID reading, memory reading, dongle exchange, flavor key transmission, stop frame, DMX off, and TTL off.
-- We have implemented all internal helper functions from liblumax.h: openDev, openDevBySerial, lumax_init_device, clearBuffer, checkIfBusy, isOpen, sendInitKey, sendKey, writeToDev, readFromDev, writeFrameBuffer, readID, readMemory, Lumax_SetBlankingDelay, dongleCom.
-- We have analyzed and implemented the four remaining API functions (verified against both `liblumax.so` on port 13337 and `lumax.dll` on port 13338):
-  - `Lumax_ReceiveDmx` — DMX receive via the new `fvr` helper: a 7-byte header `[2, cmd(0xFB0C) LE, length LE, flag, checksum]` (checksum = XOR of the six header bytes) is sent; the card echoes the checksum, streams the data bytes, then a data checksum (XOR of all data bytes) is verified. Validated for `0 < Length <= 1025`.
-  - `Lumax_Dongle_XTEA_Com` and `Lumax_DongleCom` — dongle (XTEA copy-protection) communication. The low-level 24-byte packet primitive is the new `vN67` helper (`[0xCD, address(4 LE), cmd, hdr_checksum, write(16), data_checksum]`); on top of it, `dongleRawCom` ports the raw-command layer (`Lumax_DongleCom` in the .so / `sub_4061D4` in the .dll) that interprets the response status byte (byte 12) into 2xx error codes (201/202/203/204/205/206) and copies the command-specific response words. `Lumax_Dongle_XTEA_Com` maps the public 1-9 commands onto the raw set (1→1, 2→90, 3→129, 4→131, 5→130, 6→133, 7→134, 8→132, 9→85) and additionally remaps command 1's one-byte answer (1→2, 2→1, 254→3).
-  - `Lumax_SetDacValue` — a no-op that unconditionally returns 1, matching the reference (`lumax.dll` `Lumax_SetDacValue` is `return 1;`).
-  - `Lumax_ExchangeDevInfo` — kept as a documented stub: in `lumax.dll` it is tightly bound to the obfuscated per-device `Block` struct (a marker write plus a version/features read-back) that is not modelled 1:1 in this port, so it validates its inputs and returns 1 ("not supported").
-- We have implemented `ghrkr` (the one-time lazy global constructor, guarded like the .so's `Constructor_State`). In `liblumax.so` it `malloc`s the ~10.6 MB `m_38[]` array and, for each of the 8 device slots, writes fallback config (chunk size field 1191 = 31500/7 = 4500, max scan speed field 1206 = 45000, buffer layout field 1204 = 1) plus the per-flavor scan-speed preset tables. This port keeps its device records in the static `open_devices[]`/`detected_devices[]` arrays (no malloc) and does not model the preset tables (`writeFrameBuffer` is a raw `ftdi_write_data`), so `ghrkr` reduces to: apply `apply_fallback_config()` to the open-device slots once. The fallbacks are what `Lumax_SendFrame` needs to stay safe (it divides by `MaxPoints` and clamps to `MaxScanSpeed`); `lumax_init_device` overrides them from the card's memory read, and `Lumax_OpenDevice` now calls `apply_fallback_config` after init rather than zeroing the config (previously it clobbered `MaxPoints`/`MaxScanSpeed`/`BufferLayout` back to 0, which made `SendFrame` reject every frame).
-- The library now successfully builds as a shared library (liblumax.dylib on macOS) using pkg-config to manage FTDI and USB library dependencies.
-- Focus on how the DLL interacts with the FTDI driver (`ftd2xx.dll`) to perform USB I/O.
-- Examine the frame sending process, buffer handling, and device initialization sequence.
-- Consider the safety features (e.g., emergency stop via `Lumax_StopFrame`) and how they are implemented.
-- Utilize the IDA Pro MCP servers running on ports 13337 and 13338 for advanced reverse engineering analysis.
-- Check availability of MCP server with `curl -s http://127.0.0.1:13337/config.html 2>/dev/null || echo "IDA Pro MCP server not available"` or `curl -s http://127.0.0.1:13338/config.html 2>/dev/null || echo "IDA Pro MCP server not available"`. Don't use endpoint `/health`, as it does not exist.
-
 ## Stream Timeout Prevention
 1. Do each numbered task ONE AT A TIME. Complete one task fully, confirm it worked, then move to the next.
 2. Never write a file longer than ~150 lines in a single tool call. If a file will be longer, write it in multiple append/edit passes.
 3. Start a fresh session if the conversation gets long (20+ tool calls). The error gets worse as the session grows.
 4. Keep individual grep/search outputs short. Use flags like `--include` and `-l` (list files only) to limit output size.
 5. If you do hit the timeout, retry the same step in a shorter form. Don't repeat the entire task from scratch.
+
+## Status: Live-Device Test (as of 2026-10-17)
+
+A physical **"Basic"** MiniLumax card (FTDI FT2232H, type 3; serial `FTPY4YIU`; VID 0x403 PID 0xC88A; 3,000,000 baud) is connected, and the port now passes the full `main.c` flow against it when the card starts **idle**:
+`GetPhysicalDevices → OpenDevice(1,0) → SetTTL → WaitForBuffer → SendFrame(1000 pts) → WaitForBuffer → CloseDevice`, all return codes 0.
+
+### Fixes landed this session (all compile clean; test green on an idle card)
+- **`Lumax_SendFrame`** — rewritten to the exact reference protocol (verified line-for-line vs IDA 13337 `Lumax_SendFrame` @ 0x34b8). `NumOfPoints==0` → single centered point @ 1000 PPS (def_point: Ch1=Ch2=0x8000, rest 0). ScanSpeed clamped to `[250, MaxScanSpeed]`. Chunking: `total_chunks = NumOfPoints/MaxPoints` (+1 if remainder); the **first** chunk carries the remainder, the rest carry `MaxPoints`. Per point: 6-byte prefix `[(x>>8)+16*(y>>8), x&0xFF, y&0xFF, Ch3>>8, Ch4>>8, Ch5>>8]` with `x=(Ch1>>4)&0xFFF`, `y=(Ch2>>4)&0xFFF`, plus the flavor suffix (1: +TTL byte `(TTLAvailable&2)?TTLBuffer:(p->TTL&0xFF)`; 2: none; 4: +Ch8>>8; 8: +Ch8>>8,+Ch6>>8; 16: +Ch8>>8,+Ch6>>8,+Ch7>>8). Each chunk via `Tj4(Handle, chunk, 0x8000, n_bytes, counter, 0, 0)`. Frame-end command `[3, rem_lo, rem_hi, div_lo, div_hi, final_counter, cks]` with `divisor=FrameDivisor/pps`, `final_counter=NextLoopCounts+16*(total_chunks-1)`; reads a 4-byte reply `[cks, t_lo, t_hi, flags]` — `flags&0x80` → `TimeUntilFree = 1000*tuf/pps`, else 0; `TimeOffset = 1000*NumOfPoints/pps`; `LastDivisor=pps`; toggles `NextLoopCounts` 0↔8.
+- **`Lumax_WaitForBuffer`** — gate fixed to `if ((dev->WaitGate & 8) == 0) return 0;` (was `TimeUntilFree`). Timeout mode sends `[4,1,0,0,0,0,5]`, reads 2 bytes, success iff `[5,1]`.
+- **`Lumax_StopFrame`** — now `SendFrame(Handle,NULL,0,0,0,NULL)` then, on success, `WaitForBuffer(Handle,2000,NULL,NULL)` (was a wrong 3-byte command).
+- **`Lumax_SetTTL`** — command `[0x1E, TTL, 0,0,0,0, TTL^0x1E]` (was 0x30, missing trailing checksum); response check `resp[0] == (TTL^0x1E)` unchanged.
+- **`readID`** — g4jz: write `[0xC9,0,0,0,0,0,0xC9]`, wait 50 ms, drain; 1 byte = basic (`id[4]==0`), 18 bytes = advanced (16 data + 1 XOR checksum).
+- **`readMemory`** — wp8o: write `[0xCA, start_lo, start_hi, len_lo, len_hi, 0, cks]`, read `len+2` bytes.
+- **`Lumax_CloseDevice`** — return convention fixed to 0 on success / 1 on invalid-or-failed-close (was inverted).
+- **`Tj4`** — `buffer_ptr` widened to `intptr_t` (64-bit pointer truncation).
+- **`bnQQ` + `dev_read`** — now **accumulate** bytes across repeated `ftdi_read_data` until N bytes or timeout, matching D2XX `FT_Read` (a single `ftdi_read_data` is one bulk transfer that can return after the first USB packet).
+- Added `DBG(...)` tracing (silent unless `LUMAX_DEBUG=1`) to `Tj4`, `StopFrame`, `SendFrame` frame-end, and `WaitForBuffer` timeout mode.
+
+### RESOLVED (2026-10-17) — rapid reopen failed ~50% (deterministic alternation)
+`main.c` does **not** call `Lumax_StopFrame` before `Lumax_CloseDevice`, so the card is left playing the previous run's 1000-point frame and the next `OpenDevice` can catch it mid-playback.
+- **Card model (verified with a single-process probe):** a card plays a frame **once** (~points/pps — ~100 ms for 1000 pts @ 10000 PPS) and then **self-clears to idle**; it does *not* loop. The timeout-mode query `[4,1,0,0,0,0,5]` reports BUSY (`05 00`) for the play window, then FREE (`05 01`).
+- **Root cause:** the reference `WaitForBuffer(timeout)` is *single-shot* — it queries once and fails if the card is not already free, so it fails whenever it catches the card mid-drain; a short/misaligned read (just `05`, then a leftover byte making `01 05`) made it look stuck. The reference uses the `Timeout` arg only to select this mode, not as a wait duration.
+- **Fix:** the port now *honors* the `Timeout`. In the timeout branch it purges stale RX/TX before each poll, writes the query, waits ~30 ms for the reply, reads 2 bytes, and retries every ~20 ms until the card reports `[5,1]` (free) or `Timeout` ms elapse. An idle card still answers on the first poll, so the common case is unchanged.
+- **Result:** the full `main.c` flow passes **12/12** under rapid open/close (was 4/8), all return codes 0.
+
+### REMAINING (all optional)
+1. (Optional) Add `Lumax_StopFrame` before `CloseDevice` in `main.c` for "correct" usage — not required; the library is now robust to busy-on-reopen.
+2. (Optional cleanup) Drop the `DBG(...)` instrumentation in `Tj4`/`StopFrame`/`SendFrame`/`WaitForBuffer` (silent unless `LUMAX_DEBUG=1`); remove unused statics (`dev_read_available`, `find_device_by_serial`, `find_device_by_index`) and the unused `int tmp;` in `Lumax_SetDmxMode` if `-Wunused` warnings matter.
+
+## Next Steps for Reverse Engineering
+- Core protocol work is complete and verified against a live Basic card, and the busy-on-reopen issue is **RESOLVED** (see Status above). Only optional cleanup remains.
+- We have implemented `ghrkr` (the one-time lazy global constructor, guarded like the .so's `Constructor_State`). In `liblumax.so` it `malloc`s the ~10.6 MB `m_38[]` array and, for each of the 8 device slots, writes fallback config (chunk size field 1191 = 31500/7 = 4500, max scan speed field 1206 = 45000, buffer layout field 1204 = 1) plus the per-flavor scan-speed preset tables. This port keeps its device records in the static `open_devices[]`/`detected_devices[]` arrays (no malloc) and does not model the preset tables (`writeFrameBuffer` is a raw `ftdi_write_data`), so `ghrkr` reduces to: apply `apply_fallback_config()` to the open-device slots once. The fallbacks are what `Lumax_SendFrame` needs to stay safe (it divides by `MaxPoints` and clamps to `MaxScanSpeed`); `lumax_init_device` overrides them from the card's memory read, and `Lumax_OpenDevice` now calls `apply_fallback_config` after init rather than zeroing the config (previously it clobbered `MaxPoints`/`MaxScanSpeed`/`BufferLayout` back to 0, which made `SendFrame` reject every frame).
+- (Done) FTDI I/O, frame sending, buffer handling, device-init sequence, and the safety stop are all ported and exercised against the live card — see the Status section above.
+- Utilize the IDA Pro MCP servers running on ports 13337 (liblumax.so — primary, readable) and 13338 (lumax.dll — obfuscated) for advanced reverse engineering analysis.
+- Check availability of MCP server with `curl -s http://127.0.0.1:13337/config.html 2>/dev/null || echo "IDA Pro MCP server not available"` or `curl -s http://127.0.0.1:13338/config.html 2>/dev/null || echo "IDA Pro MCP server not available"`. Don't use endpoint `/health`, as it does not exist.

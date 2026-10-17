@@ -9,9 +9,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <libftdi1/ftdi.h>
 #include "liblumax.h"
 #include "lumax.h"
+
+/* Millisecond clock (port of the Windows MMSYSTEM timeGetTime()). Monotonic,
+ * used for the WaitForBuffer poll deadline and busy-time bookkeeping. */
+#ifndef WINDOWS
+uint32_t timeGetTime(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+#endif
 
 /* Forward declarations for helper functions */
 static int U9mp(int handle);
@@ -518,7 +530,12 @@ int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanS
     int ret = 1;
     if (nmg11(Handle, (intptr_t)cmd, 7) == 7) {
         unsigned char reply[4];
-        if (bnQQ(Handle, (intptr_t)reply, 4) == 4 && reply[0] == cmd[6]) {
+        int rlen = bnQQ(Handle, (intptr_t)reply, 4);
+        DBG("SendFrame frame-end reply (%d bytes): %02x %02x %02x %02x",
+            rlen,
+            rlen > 0 ? reply[0] : 0, rlen > 1 ? reply[1] : 0,
+            rlen > 2 ? reply[2] : 0, rlen > 3 ? reply[3] : 0);
+        if (rlen == 4 && reply[0] == cmd[6]) {
             if (reply[3] & 0x80) {
                 unsigned int tuf = reply[1]
                     + max_points * ((reply[3] & 0x7F) - 1)
@@ -561,7 +578,16 @@ int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferCha
     int written, read_len;
 
     if (Timeout || !TimeToWait || !BufferChanged) {
-        /* Timeout mode or invalid output pointers */
+        /* Timeout mode or invalid output pointers.
+         *
+         * The reference (liblumax.so) issues the query once and fails if the
+         * card is not already free. That is fragile for the rapid
+         * open/stop/reopen case: a card left playing a frame is busy for one
+         * frame pass (~points/pps) and only then reports [05 01]. The
+         * `Timeout` argument is named a timeout, so we honor it: poll the
+         * single-shot query until the card reports free or `Timeout` ms have
+         * elapsed. An idle card still answers on the first poll, so this is a
+         * no-op in the common case. */
         cmd_buf[0] = 0x04;
         cmd_buf[1] = 0x01;
         cmd_buf[2] = 0x00;
@@ -570,27 +596,44 @@ int Lumax_WaitForBuffer(int Handle, int Timeout, int *TimeToWait, int *BufferCha
         cmd_buf[5] = 0x00;
         cmd_buf[6] = 0x05;
 
-        written = nmg11(Handle, (intptr_t)cmd_buf, 7);
-        if (written != 7)
-            return 1; /* Failed to write */
+        int poll_deadline = Timeout > 0 ? Timeout : 2000;
+        int poll_start = timeGetTime();
+        for (;;) {
+            /* Clean slate before each query: drop any stale/queued bytes so
+               this read is only the reply to the query we are about to send
+               (a short read otherwise leaves a byte behind and the next poll
+               reads a misaligned pair such as 01 05). */
+            ftdi_usb_purge_buffers(dev->ftdi);
+            written = nmg11(Handle, (intptr_t)cmd_buf, 7);
+            if (written != 7)
+                return 1; /* Failed to write */
+            usleep(30000); /* ~30 ms for the card to process and reply */
 
-        read_len = bnQQ(Handle, (intptr_t)response_buf, 2);
-        if (read_len != 2)
-            return 1; /* Failed to read enough */
+            read_len = bnQQ(Handle, (intptr_t)response_buf, 2);
+            DBG("WaitForBuffer(timeout) read %d bytes: %02x %02x (want 05 01)",
+                read_len,
+                read_len > 0 ? response_buf[0] : 0,
+                read_len > 1 ? response_buf[1] : 0);
 
-        if (response_buf[0] == 0x05 && response_buf[1] == 0x01) {
-            /* Success: buffer changed */
-            if (BufferChanged)
-                *BufferChanged = 1;
-            return 0;
-        } else {
-            /* Failed: buffer not changed or timeout */
-            if (BufferChanged)
-                *BufferChanged = 0;
-            /* Set a flag in write_buffer to indicate wait failure */
-            dev->write_buffer[0] = 1;
-            return 1;
+            if (read_len == 2 && response_buf[0] == 0x05 && response_buf[1] == 0x01) {
+                /* Success: buffer free */
+                if (BufferChanged)
+                    *BufferChanged = 1;
+                return 0;
+            }
+
+            /* Not free yet (or short read): retry until the timeout elapses. */
+            if (timeGetTime() - poll_start >= (unsigned int)poll_deadline)
+                break;
+            usleep(20000); /* 20 ms between polls */
         }
+
+        /* Timed out without the card reporting free. */
+        if (BufferChanged)
+            *BufferChanged = 0;
+        /* Set a flag in write_buffer to indicate wait failure */
+        dev->write_buffer[0] = 1;
+        return 1;
     } else {
         /* Normal mode: wait for buffer and return timing info */
         cmd_buf[0] = 0x04;
@@ -651,9 +694,12 @@ int Lumax_StopFrame(int Handle)
     /* Reference: a "stop" is just a single blank point at center plus a
        2-second buffer wait, so the laser goes dark and the card settles. */
     int r = Lumax_SendFrame(Handle, NULL, 0, 0, 0, NULL);
+    DBG("StopFrame: SendFrame(0) = %d", r);
     if (r)
         return r;
-    return Lumax_WaitForBuffer(Handle, 2000, NULL, NULL);
+    r = Lumax_WaitForBuffer(Handle, 2000, NULL, NULL);
+    DBG("StopFrame: WaitForBuffer(2000) = %d", r);
+    return r;
 }
 
 int Lumax_SetTTL(int Handle, int TTL)
@@ -1244,7 +1290,14 @@ static int nmg11(int handle, intptr_t buffer, int length)
 }
 
 /* bnQQ: Read buffer from device (similar to FT_Read but with device-specific formatting)
-   Returns number of bytes read, or -1 on error */
+   Returns number of bytes read, or -1 on error.
+
+   The reference .so's bnQQ wraps D2XX FT_Read, which blocks and accumulates
+   bytes across multiple USB transactions until it has exactly `length` bytes
+   or the read timeout expires. libftdi1's ftdi_read_data is a single USB
+   read that can return after the first packet, so a short response split
+   across two packets would otherwise be miscounted. To match FT_Read we loop,
+   accumulating until we have `length` bytes or a read times out / errors. */
 static int bnQQ(int handle, intptr_t buffer, int length)
 {
     struct lumax_device* dev = find_open_device_by_handle(handle);
@@ -1254,12 +1307,15 @@ static int bnQQ(int handle, intptr_t buffer, int length)
     if (!dev->ftdi)
         return -1;
 
-    /* Actual libftdi1 read */
-    int read_len = ftdi_read_data(dev->ftdi, (unsigned char*)buffer, length);
-    if (read_len < 0) {
-        return -1;
+    unsigned char *buf = (unsigned char *)buffer;
+    int total = 0;
+    while (total < length) {
+        int r = ftdi_read_data(dev->ftdi, buf + total, length - total);
+        if (r <= 0)
+            break; /* timeout or error: stop accumulating */
+        total += r;
     }
-    return read_len;
+    return total;
 }
 
 /* ---- Device-pointer-based low-level I/O ----
@@ -1283,7 +1339,16 @@ static int dev_read(struct lumax_device *dev, uint8_t *buf, int len)
 {
     if (!dev || !dev->ftdi)
         return 1;
-    return (ftdi_read_data(dev->ftdi, buf, len) == len) ? 0 : 1;
+    /* FT_Read semantics: accumulate across packets until `len` bytes arrive or
+       a read times out (same reasoning as bnQQ above). */
+    int total = 0;
+    while (total < len) {
+        int r = ftdi_read_data(dev->ftdi, buf + total, len - total);
+        if (r <= 0)
+            break;
+        total += r;
+    }
+    return (total == len) ? 0 : 1;
 }
 
 /* Emulates FT_GetQueueStatus (the .so's LUO2): returns the number of bytes
@@ -1714,28 +1779,38 @@ static int Tj4(int handle, intptr_t buffer_ptr, unsigned short a3, unsigned shor
     header1[6] = v13;
 
     /* Send header */
-    if (nmg11(handle, (intptr_t)header1, 7) != 7)
+    if (nmg11(handle, (intptr_t)header1, 7) != 7) {
+        DBG("Tj4: header write failed (v9=%u cks=0x%02x)", v9, v13);
         return v16; /* Error */
+    }
 
     /* Send DMX buffer */
-    if (nmg11(handle, buffer_ptr, a4) != a4)
+    if (nmg11(handle, buffer_ptr, a4) != a4) {
+        DBG("Tj4: data write failed (a4=%u)", a4);
         return v16; /* Error */
+    }
 
     if (a6) {
         /* Read 2 bytes and return the number of bytes read */
         unsigned char resp[2];
         int read_len = bnQQ(handle, (intptr_t)resp, 2);
-        if (read_len < 0)
+        if (read_len < 0) {
+            DBG("Tj4: read (a6) failed");
             return v16;
+        }
         return read_len; /* Note: original returns the read length */
     } else {
         /* Expect exactly 2 bytes: [v13, 0x55] */
         unsigned char resp[2];
         int read_len = bnQQ(handle, (intptr_t)resp, 2);
-        if (read_len != 2)
+        if (read_len != 2) {
+            DBG("Tj4: read got %d bytes (want 2)", read_len);
             return v16;
-        if (resp[0] != v13 || resp[1] != 0x55)
+        }
+        if (resp[0] != v13 || resp[1] != 0x55) {
+            DBG("Tj4: resp [0x%02x 0x%02x] != [0x%02x 0x55]", resp[0], resp[1], v13);
             return v16;
+        }
         return 0; /* Success */
     }
 }
