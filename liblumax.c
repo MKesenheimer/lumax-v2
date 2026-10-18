@@ -1309,11 +1309,20 @@ static int bnQQ(int handle, intptr_t buffer, int length)
 
     unsigned char *buf = (unsigned char *)buffer;
     int total = 0;
+    /* Honor usb_read_timeout as a monotonic deadline. ftdi_read_data on this
+       stack returns ~immediately with whatever is buffered (0 if none), so we
+       must re-poll until we have `length` bytes or the budget elapses; a single
+       empty read does NOT mean the reply has failed to arrive. */
+    int budget = dev->ftdi->usb_read_timeout;
+    int start = timeGetTime();
     while (total < length) {
         int r = ftdi_read_data(dev->ftdi, buf + total, length - total);
-        if (r <= 0)
-            break; /* timeout or error: stop accumulating */
-        total += r;
+        if (r > 0) { total += r; continue; }
+        if (budget <= 0)
+            break; /* non-blocking: nothing ready right now */
+        if (timeGetTime() - start >= (unsigned int)budget)
+            break; /* deadline reached */
+        usleep(2000); /* ~2 ms between polls */
     }
     return total;
 }
@@ -1340,13 +1349,19 @@ static int dev_read(struct lumax_device *dev, uint8_t *buf, int len)
     if (!dev || !dev->ftdi)
         return 1;
     /* FT_Read semantics: accumulate across packets until `len` bytes arrive or
-       a read times out (same reasoning as bnQQ above). */
+       the read-timeout budget elapses. Re-poll on empty reads (ftdi_read_data
+       returns ~immediately here) -- see bnQQ above. */
     int total = 0;
+    int budget = dev->ftdi->usb_read_timeout;
+    int start = timeGetTime();
     while (total < len) {
         int r = ftdi_read_data(dev->ftdi, buf + total, len - total);
-        if (r <= 0)
+        if (r > 0) { total += r; continue; }
+        if (budget <= 0)
             break;
-        total += r;
+        if (timeGetTime() - start >= (unsigned int)budget)
+            break;
+        usleep(2000);
     }
     return (total == len) ? 0 : 1;
 }
@@ -1604,21 +1619,39 @@ int readID(struct lumax_device *dev, uint8_t *arr, uint16_t size)
     if (dev_write(dev, cmd, 7))
         return 1;
 
-    usleep(50000); /* 50 ms, matches reference */
+    usleep(50000); /* 50 ms initial settle, matches reference */
 
-    /* Drain everything the card has sent (echo and data arrive as separate
-       USB packets, so read repeatedly until the pipe runs dry, up to 18). */
+    /* Accumulate everything the card sends (the 0xC9 echo, and for an advanced
+       card 16 data bytes + 1 checksum right after it).
+       NOTE: on the macOS libftdi1+libusb stack ftdi_read_data returns in ~1 ms
+       rather than blocking for usb_read_timeout, so a single drain attempt
+       races the echo's USB delivery and intermittently sees 0 bytes even though
+       the byte is still in the buffer a few ms later (it is never lost). Poll
+       with a monotonic deadline instead: wait for the first byte, then keep a
+       short window open for follow-on bytes before classifying basic/advanced. */
     unsigned char acc[18];
     int total = 0;
     int save_to = dev->ftdi->usb_read_timeout;
-    dev->ftdi->usb_read_timeout = 120; /* short: catch what is ready */
-    for (;;) {
+    dev->ftdi->usb_read_timeout = 0; /* non-blocking poll */
+
+    /* Phase 1: wait (up to ~300 ms) for the first byte, the 0xC9 echo. */
+    int start1 = timeGetTime();
+    while (total < 1) {
         int r = ftdi_read_data(dev->ftdi, acc + total, 18 - total);
-        if (r <= 0)
-            break;
-        total += r;
-        if (total >= 18)
-            break;
+        if (r > 0) { total += r; continue; }
+        if (timeGetTime() - start1 >= 300) break;
+        usleep(5000); /* ~5 ms between polls */
+    }
+
+    /* Phase 2: brief grace window to collect follow-on bytes (advanced card).
+       A basic card sends only the echo, so this just confirms nothing more. */
+    if (total > 0 && total < 18) {
+        int start2 = timeGetTime();
+        while (total < 18 && timeGetTime() - start2 < 40) {
+            int r = ftdi_read_data(dev->ftdi, acc + total, 18 - total);
+            if (r > 0) { total += r; continue; }
+            usleep(2000);
+        }
     }
     dev->ftdi->usb_read_timeout = save_to;
 
