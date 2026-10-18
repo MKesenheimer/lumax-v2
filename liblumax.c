@@ -1116,19 +1116,23 @@ int openDevBySerial(const char *serial, struct lumax_device *dev)
     return 0;
 }
 
-/* Port of HJdd (liblumax.so): finalize the point geometry for the active
- * flavor. v10 = DmxFlavorMask (0 for a basic card -> treated as 1).
- * flavor = Flavor & mask. Per flavor, BytesPerPoint and MaxScanSpeed are fixed
- * and MaxPoints = FrameCapacity / BytesPerPoint. For a basic card (mask 0)
- * this is a pure computation with no USB I/O; for a Bare-Lumax card (mask
- * non-zero) the reference also sends a 7-byte flavor command (gKTU + a framed
- * header + 2-byte verify), which this port does not model. 0 on success. */
+/* Port of HJdd (liblumax.so @0x2a5a): finalize the point geometry for the
+ * active flavor. mask = DmxFlavorMask (0 for a basic card -> treated as 1);
+ * the effective flavor is dev->Flavor & mask. Per flavor BytesPerPoint and
+ * MaxScanSpeed are fixed and MaxPoints = FrameCapacity / BytesPerPoint.
+ * For a basic card (mask 0) this is a pure computation with no USB I/O. For a
+ * Bare-Lumax card (mask non-zero) the reference first runs gKTU (a 0x09 reset
+ * verified by a 1-byte reply) and then sends a 7-byte flavor command, verified
+ * by a 2-byte reply [checksum, raw_flavor]; the geometry is only committed if
+ * that reply matches. 0 on success. */
 static int hjdd(struct lumax_device *dev)
 {
-    if (!dev)
+    if (!dev || !dev->ftdi)
         return 1;
+    int handle = dev->numDev;
+    int raw_flavor = dev->Flavor;                 /* a2 in the reference */
     int mask = dev->DmxFlavorMask ? dev->DmxFlavorMask : 1;
-    int flavor = dev->Flavor & mask;
+    int flavor = raw_flavor & mask;
     int bytes_per_point = 0;
     int max_scanspeed = 0;
     if (flavor == 1)      { bytes_per_point = 7; max_scanspeed = 70000; }
@@ -1141,10 +1145,48 @@ static int hjdd(struct lumax_device *dev)
     int max_points = dev->FrameCapacity / bytes_per_point;
     if (max_points <= 0)
         return 1;
+
     if (dev->DmxFlavorMask) {
-        /* Bare-Lumax flavor command not modelled in this port. */
-        return 1;
+        /* gKTU (reference @0x294c): write [0x09,0,0,0,0,0,0x09], the card
+           echoes 0x09. Its return is ignored by the reference HJdd, so we log
+           a mismatch but proceed to the flavor command. */
+        unsigned char reset[7] = {0x09, 0, 0, 0, 0, 0, 0x09};
+        if (nmg11(handle, (intptr_t)reset, 7) == 7) {
+            unsigned char echo = 0;
+            if (bnQQ(handle, (intptr_t)&echo, 1) == 1)
+                DBG("hjdd gKTU echo=0x%02x (expect 0x09)", echo);
+        } else {
+            DBG("hjdd gKTU reset write failed");
+        }
+
+        /* 7-byte flavor command: [7, flavor, 0, maxpts_lo, maxpts_hi, 0, cks]
+           with cks = maxpts_hi ^ maxpts_lo ^ flavor ^ 7. */
+        unsigned char cmd[7];
+        cmd[0] = 7;
+        cmd[1] = (unsigned char)flavor;
+        cmd[2] = 0;
+        cmd[3] = (unsigned char)(max_points & 0xFF);
+        cmd[4] = (unsigned char)((max_points >> 8) & 0xFF);
+        cmd[5] = 0;
+        cmd[6] = (unsigned char)(cmd[4] ^ cmd[3] ^ cmd[1] ^ cmd[0]);
+        if (nmg11(handle, (intptr_t)cmd, 7) != 7) {
+            DBG("hjdd flavor command write failed");
+            return 1;
+        }
+        /* Verify: 2-byte reply [checksum, raw_flavor]. */
+        unsigned char reply[2] = {0, 0};
+        if (bnQQ(handle, (intptr_t)reply, 2) != 2) {
+            DBG("hjdd flavor reply short (expected 2 bytes)");
+            return 1;
+        }
+        if (reply[0] != cmd[6] || reply[1] != (unsigned char)raw_flavor) {
+            DBG("hjdd flavor reply mismatch: got [0x%02x,0x%02x] want [0x%02x,0x%02x]",
+                reply[0], reply[1], cmd[6], raw_flavor & 0xFF);
+            return 1;
+        }
+        DBG("hjdd flavor command ok (flavor=%d max_points=%d)", flavor, max_points);
     }
+
     dev->Flavor = flavor;
     dev->BytesPerPoint = bytes_per_point;
     dev->MaxPoints = max_points;
@@ -1204,10 +1246,11 @@ int lumax_init_device(struct lumax_device *dev)
             DBG("  id[%d]=0x%02x", i, id[i]);
     }
 
-    /* 3. Advanced-card config (only when id[4] > 6). The connected card is
-     * basic (id[4]==0) so this branch is not taken; it is kept for fidelity.
-     * wp8o reads 15 bytes of card memory; a read failure invalidates the open
-     * in the reference (v10[1]=0). */
+    /* 3. Advanced-card config (only when id[4] > 6). readID validates the
+     * 18-byte id block with an XOR checksum, so id[4] is trustworthy here.
+     * wp8o (readMemory) reads 15 bytes of card config; readMemory also verifies
+     * its reply, so the bytes below are reliable. A read failure invalidates
+     * the open in the reference (v10[1]=0). */
     if (r == 0 && id[4] > 6) {
         dev->dmx_state_byte = 5;    /* reference: v10[324143] = 5 for advanced */
         uint8_t mem[16];
@@ -1215,12 +1258,46 @@ int lumax_init_device(struct lumax_device *dev)
             DBG("init wp8o readMemory (advanced) failed");
             return -1;
         }
-        /* The reference then performs the dongle exchange (Lumax_DongleCom cmd
-         * 1) and, for id[4] 9..11, applies the card's flavor/mask/waitgate and
-         * (for id[4] > 10) re-derives the frame divisor. That memory layout is
-         * not modelled in this port; HJdd below still finalizes the point
-         * geometry for whatever Flavor is set. */
-        DBG("init: advanced card (id[4]=%d); flavor config left to HJdd", id[4]);
+        int m;
+        DBG("init advanced card id[4]=%d, mem[15]:", id[4]);
+        for (m = 0; m < 15; m++)
+            DBG("  mem[%d]=0x%02x", m, mem[m]);
+
+        /* Dongle exchange (reference vN67 cmd 1 at the default address). The
+         * reference nulls the FTDI handle on failure (v10[1]=0) so the whole
+         * open is rejected. This port runs the exchange for fidelity and logs
+         * the result, but does NOT abort the open on a dongle miss: the
+         * laser-output path (flavor config + HJdd + the StopFrame/SetDmxMode/
+         * SetTTL gate below) is what the user needs, and a card whose transport
+         * already answers readID/readMemory is still drivable. */
+        {
+            unsigned long v4 = 0;
+            int dr = Lumax_DongleCom(handle, 1, 0x49D4B13A, NULL, &v4);
+            DBG("init Lumax_DongleCom(1) = %d (0=ok, else dongle miss/err)", dr);
+        }
+
+        /* Flavor / mask / waitgate (reference, id[4] in 9..11):
+             slot[31] |= 1                 -> TTLAvailable |= 1
+             slot[50]  = mem[9]            -> DmxFlavorMask
+             slot[49]  = mem[10]           -> Flavor
+             slot[52]  = mem[11]           -> WaitGate
+             slot[53]  = (WaitGate&1)<<8 + mem[12] + 1   (unmodelled here)
+             if ((Flavor & DmxFlavorMask) == 0xFF) Flavor = 4; */
+        if (id[4] > 8 && id[4] <= 0xB) {
+            dev->TTLAvailable  |= 1;
+            dev->DmxFlavorMask = mem[9];
+            dev->Flavor        = mem[10];
+            dev->WaitGate      = mem[11];
+            if ((dev->Flavor & dev->DmxFlavorMask) == 0xFF)
+                dev->Flavor = 4;
+            DBG("init flavor config: mask=0x%02x flavor=%d waitgate=0x%02x",
+                dev->DmxFlavorMask, dev->Flavor, dev->WaitGate);
+        }
+
+        /* id[4] > 10 only (reference): optional frame-divisor re-derive. Not
+         * needed for an id[4]==10 card; kept for fidelity. */
+        if (id[4] > 0xA && mem[14] == 4)
+            dev->FrameDivisor = 20000000;
     }
 
     /* 4. HJdd: finalize BytesPerPoint / MaxPoints / MaxScanSpeed / Flavor for
