@@ -504,7 +504,7 @@ class lumax_renderer:
             # insert blank point at the beginning
             index += 1
             buffer.struct_arr[index].x = xout(p[0, 0])
-            buffer.struct_arr[index].y = (255 * 255 * self.mirrory) + (-1)**(self.mirrory) * numpy.int32(p[0, 1])
+            buffer.struct_arr[index].y = xout(p[0, 1])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
@@ -513,7 +513,7 @@ class lumax_renderer:
             for j in range(0, len(p)):
                 index += 1
                 buffer.struct_arr[index].x = xout(p[j, 0])
-                buffer.struct_arr[index].y = (255 * 255 * self.mirrory) + (-1)**(self.mirrory) * numpy.int32(p[j, 1])
+                buffer.struct_arr[index].y = xout(p[j, 1])
                 buffer.struct_arr[index].r = p[j, 2]
                 buffer.struct_arr[index].g = p[j, 3]
                 buffer.struct_arr[index].b = p[j, 4]
@@ -521,7 +521,7 @@ class lumax_renderer:
             # insert blank point at the end
             index += 1
             buffer.struct_arr[index].x = xout(p[len(p) - 1, 0])
-            buffer.struct_arr[index].y = (255 * 255 * self.mirrory) + (-1)**(self.mirrory) * numpy.int32(p[len(p) - 1, 1])
+            buffer.struct_arr[index].y = xout(p[len(p) - 1, 1])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
