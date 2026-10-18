@@ -8,16 +8,27 @@ This project involves reversing the Lumax DLL (`lumax.dll`) which controls Lumax
   - Contains `lumax.dll` (the library to reverse), `Lumax_dll.bas` (API declarations), `Form1.frm`, `Global.bas`, and a compiled example executable `Beispiel_Lumax_VB.exe`.
   - The example shows how to enumerate devices, open handles, send laser frames (drawing a circle), and handle device closing.
 
-- `minilumax_test/`: A test directory for the Lumax driver.
-  - Contains `minilumax.exe` (test program), `lumax.dll` (same library), `readme.txt` (version and usage notes), `ML_Driver.mld` (possibly a Microchip Lab project file), and `liblumax.so` (Linux shared library for the Lumax driver).
+- `resources/`: Reverse-engineering resources and reference files.
+  - `resources/minilumax_test/`: Original test directory with `minilumax.exe`, `lumax.dll`, `readme.txt`, `ML_Driver.mld`, and `liblumax.so` (Linux shared library).
+  - `resources/minilumax_usb_64/`: FTDI USB driver files (both 32-bit and 64-bit) required for the Lumax DLL to function. Includes `ftd2xx.h`, DLLs (`ftd2xx.dll`, `ftlang.dll`, etc.), driver `.sys` and `.inf` files, and release documentation.
 
-- `minilumax_usb_64/`: FTDI USB driver files (both 32-bit and 64-bit) required for the Lumax DLL to function.
-  - Includes `ftd2xx.h`, DLLs (`ftd2xx.dll`, `ftlang.dll`, etc.), driver `.sys` and `.inf` files, and release documentation.
+- `libs/`: Compiled shared libraries (output directory).
+  - `liblumax.dylib` / `liblumax.so` - macOS / Linux shared library
+  - `liblumax.o` - object file
+
+- `test/`: Test programs.
+  - `main.c` - Simple test program demonstrating usage of the Lumax API.
+
+- `python/`: Python bindings for liblumax.
+  - `python/lumaxlib.py` - ctypes wrapper for the C library
+  - `python/demo.py` - Demo script showing laser frame generation
+  - `python/demo_multi.py` - Multi-device demo
+  - `python/libs/` - Copies of the shared library for Python to load
 
 ## Additional Files Provided
 - `lumax.h`: C header with API definitions and TLumax_Point struct.
 - `liblumax.h`: Internal header with helper functions and device structure.
-- `main.c`: Simple test program demonstrating usage.
+- `liblumax.c`: Main implementation of the Lumax library.
 
 ## API Documentation (from Lumax_dll.bas)
 The Lumax DLL exports the following functions (as declared in Visual Basic):
@@ -111,9 +122,8 @@ Based on analysis of `lumax.dll` exports and header files, the following functio
 5. If you do hit the timeout, retry the same step in a shorter form. Don't repeat the entire task from scratch.
 
 ## Status: Live-Device Test (as of 2026-10-17)
-
-A physical **"Basic"** MiniLumax card (FTDI FT2232H, type 3; serial `FTPY4YIU`; VID 0x403 PID 0xC88A; 3,000,000 baud) is connected, and the port now passes the full `main.c` flow against it when the card starts **idle**:
-`GetPhysicalDevices → OpenDevice(1,0) → SetTTL → WaitForBuffer → SendFrame(1000 pts) → WaitForBuffer → CloseDevice`, all return codes 0.
+A physical **"Basic"** MiniLumax card (FTDI FT2232H, type 3; serial `FTPY4YIU`; VID 0x403 PID 0xC88A; 3,000,000 baud) is connected, and the port now passes the full `main.c` flow against it (reliably, even when the card starts busy after a previous run):
+`GetPhysicalDevices → OpenDevice(1,0) → SetTTL → WaitForBuffer → SendFrame(1000 pts) → WaitForBuffer → StopFrame → CloseDevice`, all return codes 0.
 
 ### Fixes landed this session (all compile clean; test green on an idle card)
 - **`Lumax_SendFrame`** — rewritten to the exact reference protocol (verified line-for-line vs IDA 13337 `Lumax_SendFrame` @ 0x34b8). `NumOfPoints==0` → single centered point @ 1000 PPS (def_point: Ch1=Ch2=0x8000, rest 0). ScanSpeed clamped to `[250, MaxScanSpeed]`. Chunking: `total_chunks = NumOfPoints/MaxPoints` (+1 if remainder); the **first** chunk carries the remainder, the rest carry `MaxPoints`. Per point: 6-byte prefix `[(x>>8)+16*(y>>8), x&0xFF, y&0xFF, Ch3>>8, Ch4>>8, Ch5>>8]` with `x=(Ch1>>4)&0xFFF`, `y=(Ch2>>4)&0xFFF`, plus the flavor suffix (1: +TTL byte `(TTLAvailable&2)?TTLBuffer:(p->TTL&0xFF)`; 2: none; 4: +Ch8>>8; 8: +Ch8>>8,+Ch6>>8; 16: +Ch8>>8,+Ch6>>8,+Ch7>>8). Each chunk via `Tj4(Handle, chunk, 0x8000, n_bytes, counter, 0, 0)`. Frame-end command `[3, rem_lo, rem_hi, div_lo, div_hi, final_counter, cks]` with `divisor=FrameDivisor/pps`, `final_counter=NextLoopCounts+16*(total_chunks-1)`; reads a 4-byte reply `[cks, t_lo, t_hi, flags]` — `flags&0x80` → `TimeUntilFree = 1000*tuf/pps`, else 0; `TimeOffset = 1000*NumOfPoints/pps`; `LastDivisor=pps`; toggles `NextLoopCounts` 0↔8.
@@ -126,17 +136,32 @@ A physical **"Basic"** MiniLumax card (FTDI FT2232H, type 3; serial `FTPY4YIU`; 
 - **`Tj4`** — `buffer_ptr` widened to `intptr_t` (64-bit pointer truncation).
 - **`bnQQ` + `dev_read`** — now **accumulate** bytes across repeated `ftdi_read_data` until N bytes or timeout, matching D2XX `FT_Read` (a single `ftdi_read_data` is one bulk transfer that can return after the first USB packet).
 - Added `DBG(...)` tracing (silent unless `LUMAX_DEBUG=1`) to `Tj4`, `StopFrame`, `SendFrame` frame-end, and `WaitForBuffer` timeout mode.
+- **`main.c`** — added `Lumax_StopFrame(Handle)` before `Lumax_CloseDevice(Handle)` (the documented "correct" usage; each run now leaves the card idle, so back-to-back runs start from a known-free card).
 
 ### RESOLVED (2026-10-17) — rapid reopen failed ~50% (deterministic alternation)
-`main.c` does **not** call `Lumax_StopFrame` before `Lumax_CloseDevice`, so the card is left playing the previous run's 1000-point frame and the next `OpenDevice` can catch it mid-playback.
+`main.c` originally did **not** call `Lumax_StopFrame` before `Lumax_CloseDevice`, so the card was left playing the previous run's 1000-point frame and the next `OpenDevice` could catch it mid-playback. (That call has since been added to `main.c`; the library fix below is the real robustness change.)
 - **Card model (verified with a single-process probe):** a card plays a frame **once** (~points/pps — ~100 ms for 1000 pts @ 10000 PPS) and then **self-clears to idle**; it does *not* loop. The timeout-mode query `[4,1,0,0,0,0,5]` reports BUSY (`05 00`) for the play window, then FREE (`05 01`).
 - **Root cause:** the reference `WaitForBuffer(timeout)` is *single-shot* — it queries once and fails if the card is not already free, so it fails whenever it catches the card mid-drain; a short/misaligned read (just `05`, then a leftover byte making `01 05`) made it look stuck. The reference uses the `Timeout` arg only to select this mode, not as a wait duration.
 - **Fix:** the port now *honors* the `Timeout`. In the timeout branch it purges stale RX/TX before each poll, writes the query, waits ~30 ms for the reply, reads 2 bytes, and retries every ~20 ms until the card reports `[5,1]` (free) or `Timeout` ms elapse. An idle card still answers on the first poll, so the common case is unchanged.
 - **Result:** the full `main.c` flow passes **12/12** under rapid open/close (was 4/8), all return codes 0.
 
+### RESOLVED (2026-10-18) — a *second* card ("FTP4PW27") opened intermittently / no laser output
+A second physical card was connected (serial `FTP4PW27`, same VID/PID `0x403/0xC88A` as the working `FTPY4YIU`). It produced no laser output, and `OpenDevice` intermittently failed. It was suspected to be "an older flavor", but raw FTDI probes proved it is a **normal basic card**: it echoes the readID `0xC9` command on 15/15 tries within ~5 ms.
+- **Root cause — a read-timing race, not a flavor difference.** On the macOS libftdi1 + libusb stack, `ftdi_read_data()` returns in ~1 ms **instead of blocking** for `usb_read_timeout` (measured: a read given a 400 ms budget returned in 0.2–2.7 ms). `readID` does a 50 ms settle then a *single* drain attempt; when the `0xC9` echo's USB delivery landed in the microsecond gap after that attempt, `readID` read 0 bytes and failed (the byte is *still in the buffer* a few ms later — it is never lost; a re-read catches it). The failure then poisoned the next read (StopFrame's frame-end read saw the stale echo as `[0xc9 0x86] != [0x86 0x55]`), so `lumax_init_device` failed → `OpenDevice` returned 0 → no frames sent → no laser. Before the fix ~1/5 runs failed; the previously-working card merely won the race more often.
+- **Fix:** the three single-shot readers now **poll against a monotonic deadline** (honoring `usb_read_timeout` as a real wait) instead of trusting one non-blocking read: `readID` (wait up to ~300 ms for the echo, then a ~40 ms grace window for advanced-card follow-on bytes), and `bnQQ` / `dev_read` (re-poll until the expected byte count arrives or the budget elapses; `bnQQ`/`dev_read` had the same latent race that would have hit frame-end and DMX reads).
+- **Result:** the full `main.c` flow passes **20/20** back-to-back, all return codes 0 (frame-end replies carry valid checksums, e.g. `bc 01 00 81`, `a6 01 00 81`); **both cards drive the show laser** and were confirmed producing output by the operator.
+
+### RESOLVED (2026-10-18) — a *third* card ("LXPVB77T"): opened & responded, but **no laser** (advanced flavor 4)
+A third physical card (serial `LXPVB77T`, `id[4]=0x0a`) connected. It opened cleanly and answered every status command (so "the device responds"), yet produced **no laser output**. This one is genuinely a different flavor — it is an **advanced "flavor 4"** card, not the basic flavor 1 of the other two.
+- **Root cause — the advanced-card config was never applied.** `lumax_init_device` read the card's config memory but left `Flavor` at the default `1`, and `hjdd` **hard-failed** whenever `DmxFlavorMask` was set instead of sending the reference's 7-byte *flavor command*. So the card was never told it is flavor 4 and never configured; it accepted the connection but never armed the beam. Flavor 4 is 7 bytes/point like flavor 1, but its 7th byte is `Ch8>>8` (an extra channel) rather than a TTL control byte, and its `MaxScanSpeed` is 65000 (vs 70000).
+- **Card memory (validated by `readMemory`'s XOR checksum):** `mem[9]=0x06` (DmxFlavorMask), `mem[10]=0x04` (Flavor), `mem[11]=0xFE` (WaitGate); `mem[1..8]` = the serial "LXPVB77T". With `(Flavor & Mask)=0x04 != 0xFF` the effective flavor is **4**.
+- **Fix (ported verbatim from reference `Lumax_OpenDevice` @0x4b2b / `HJdd` @0x2a5a / `gKTU` @0x294c):**
+  - `lumax_init_device` advanced block now applies the memory config: `TTLAvailable |= 1`, `DmxFlavorMask=mem[9]`, `Flavor=mem[10]`, `WaitGate=mem[11]`, the `(Flavor & Mask)==0xFF→4` rule, the `id[4]>10` divisor re-derive, **and** the dongle exchange `Lumax_DongleCom(handle,1,0x49D4B13A,...)`. (The reference nulls the FTDI handle on a dongle miss, aborting the open; this port runs the exchange for fidelity and logs the result but does not abort on a miss — here the dongle is present and the exchange returns 0.)
+  - `hjdd` now sends the real flavor sequence instead of failing: the `gKTU` `0x09` reset (verified by a 1-byte `0x09` echo), then the 7-byte flavor command `[7, flavor, 0, maxpts_lo, maxpts_hi, 0, cks]` with `cks = maxpts_hi ^ maxpts_lo ^ flavor ^ 7`, verified against the 2-byte reply `[checksum, raw_flavor]`; the geometry (`Flavor`/`BytesPerPoint`/`MaxPoints`/`MaxScanSpeed`) is committed only on a matching reply.
+- **Result (verified by operator):** init trace shows `id[4]=0x0a`, `Lumax_DongleCom(1)=0` (dongle OK), `hjdd flavor command ok (flavor=4 max_points=4500)`, geometry `flavor=4 BytesPerPoint=7 MaxPoints=4500 MaxScanSpeed=65000`, frame sent as **7000 bytes** (1000 × 7) and played (`TimeToWait≈99`). **All three cards now drive the show laser**; output confirmed positive by the operator.
+
 ### REMAINING (all optional)
-1. (Optional) Add `Lumax_StopFrame` before `CloseDevice` in `main.c` for "correct" usage — not required; the library is now robust to busy-on-reopen.
-2. (Optional cleanup) Drop the `DBG(...)` instrumentation in `Tj4`/`StopFrame`/`SendFrame`/`WaitForBuffer` (silent unless `LUMAX_DEBUG=1`); remove unused statics (`dev_read_available`, `find_device_by_serial`, `find_device_by_index`) and the unused `int tmp;` in `Lumax_SetDmxMode` if `-Wunused` warnings matter.
+1. (Optional cleanup) Drop the `DBG(...)` instrumentation in `Tj4`/`StopFrame`/`SendFrame`/`WaitForBuffer` (silent unless `LUMAX_DEBUG=1`); remove unused statics (`dev_read_available`, `find_device_by_serial`, `find_device_by_index`) and the unused `int tmp;` in `Lumax_SetDmxMode` if `-Wunused` warnings matter.
 
 ## Next Steps for Reverse Engineering
 - Core protocol work is complete and verified against a live Basic card, and the busy-on-reopen issue is **RESOLVED** (see Status above). Only optional cleanup remains.
