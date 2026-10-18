@@ -1,5 +1,5 @@
 # Makefile for liblumax - Lumax laser controller library
-# Builds shared library for Linux and macOS
+# Builds shared library for Linux and macOS, outputs to ./libs and ./python/libs
 
 CC ?= gcc
 CFLAGS ?= -Wall -Wextra -O2 -fPIC
@@ -28,19 +28,45 @@ ifeq ($(UNAME_S),Darwin)
     INCLUDES = -I. $(FTDI_INCLUDE_PATH)
 endif
 
+# Output directories
+LIB_DIR = ./libs
+PYTHON_LIB_DIR = ./python/libs
+
 # Source files
 SRCS = liblumax.c
 OBJS = $(SRCS:.c=.o)
 
-all: $(TARGET)
+# Targets in lib directory
+LIB_TARGET = $(LIB_DIR)/$(TARGET)
+LIB_OBJ = $(LIB_DIR)/liblumax.o
 
-$(TARGET): $(OBJS)
+# Targets in python lib directory
+PYTHON_LIB_TARGET = $(PYTHON_LIB_DIR)/$(TARGET)
+PYTHON_LIB_OBJ = $(PYTHON_LIB_DIR)/liblumax.o
+
+all: $(LIB_TARGET) $(PYTHON_LIB_TARGET)
+
+# Build library in ./libs
+$(LIB_TARGET): $(LIB_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-%.o: %.c
+$(LIB_OBJ): liblumax.c
+	@mkdir -p $(LIB_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Build library in ./python/libs (copy from ./libs)
+$(PYTHON_LIB_TARGET): $(LIB_TARGET)
+	@mkdir -p $(PYTHON_LIB_DIR)
+	cp $(LIB_TARGET) $(PYTHON_LIB_TARGET)
+	cp $(LIB_OBJ) $(PYTHON_LIB_OBJ)
+
+# Also copy .o file
+$(PYTHON_LIB_OBJ): $(LIB_OBJ)
+	@mkdir -p $(PYTHON_LIB_DIR)
+	cp $(LIB_OBJ) $(PYTHON_LIB_OBJ)
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+	rm -rf $(LIB_DIR) $(PYTHON_LIB_DIR)
 
 .PHONY: all clean
