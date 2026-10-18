@@ -273,12 +273,15 @@ int Lumax_OpenDevice(int PhysicalDevice, int Channel)
     if (PhysicalDevice < 1 || PhysicalDevice > num_detected_devices)
         return 0;
 
-    /* Check if device is already open (we could allow reopening, but we'll prevent double open) */
-    /* We can check if the device is already in open_devices by serial number */
+    /* Check if device is already open (we could allow reopening, but we'll
+       prevent double open). Handles are stable (a closed card keeps its slot
+       for the process's life, mirroring the reference's fixed m_38 slots), so
+       scan by serial but only over slots whose FTDI link is still live. */
     struct lumax_device* dev = &detected_devices[PhysicalDevice-1];
     int i;
     for (i = 0; i < num_open_devices; i++) {
-        if (strcmp(open_devices[i].serial, dev->serial) == 0) {
+        if (open_devices[i].ftdi &&
+            strcmp(open_devices[i].serial, dev->serial) == 0) {
             /* Already open */
             return 0;
         }
@@ -386,14 +389,10 @@ int Lumax_CloseDevice(int Handle)
         return 1; /* no open link (reference: v4[1]==0 -> return 1) */
     }
 
-    /* Remove from open_devices array */
-    int index = Handle - 1;
-    if (index >= 0 && index < num_open_devices) {
-        int i;
-        for (i = index; i < num_open_devices - 1; i++)
-            open_devices[i] = open_devices[i + 1];
-        num_open_devices--;
-    }
+    /* Keep the slot (handles are stable, mirroring the reference's fixed m_38
+       slots): a closed card's numDev is never reassigned this process, so
+       every other open card's handle stays valid. Do NOT shift the array or
+       decrement num_open_devices -- that invalidates the higher cards' handles. */
     return result;
 }
 
