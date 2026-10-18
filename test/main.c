@@ -13,7 +13,6 @@ int main()
   int i, NumOfCards, Handle, result, TimeToWait, BufferChanged;
   unsigned char Buffer[1000];
   TLumax_Point Points[1000];
-  printf("**********************************************************\n");
   NumOfCards = Lumax_GetPhysicalDevices();
   printf("Number of MiniLumax devices: %i\n", NumOfCards);
   if (NumOfCards > 0)
@@ -36,7 +35,7 @@ int main()
         Points[i].Ch8 = 0;
         Points[i].Ch6 = 0;
         Points[i].Ch7 = 0;
-//        Points[i].TTL = TTL;
+        //Points[i].TTL = TTL;
        }
       result = Lumax_SendFrame(Handle, Points, 1000, 10000, 0, NULL);
       printf("Lumax_SendFrame return code: %i\n", result);

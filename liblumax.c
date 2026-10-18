@@ -1753,7 +1753,6 @@ int dongleCom(struct lumax_device *dev, uint8_t flag, uint32_t address, uint8_t 
 }
 
 /* Helper function reverse engineered from Tj4 in liblumax.so */
-/* Helper function reverse engineered from Tj4 in liblumax.so */
 static int Tj4(int handle, intptr_t buffer_ptr, unsigned short a3, unsigned short a4, char a5, int a6, int a7)
 {
     struct lumax_device* dev = find_open_device_by_handle(handle);

@@ -1,8 +1,7 @@
 *.o
 *.dylib
 .DS_Store
-Example_VB/
-minilumax_test/
-minilumax_usb_64/
-test
-probe
+resources
+test/test
+python/__pycache__
+python/libs
