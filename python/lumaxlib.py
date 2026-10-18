@@ -403,12 +403,13 @@ class lumax:
         self.lumax_lib.Lumax_SetBlankingDelay(c_int(delay_ms))
 
 class lumax_renderer:
-    def __init__(self, numDev = 1, mirrorx = 0, mirrory = 0, zoom = 1.0):
+    def __init__(self, numDev = 1, mirrorx = 0, mirrory = 0, zoom = 1.0, swapxy = 0):
         # numDev: which card to drive (1..8, selected by ascending USB serial
         # in the C library). Use separate renderers for separate cards.
         # mirrorx / mirrory: 0 or 1, flip the drawn pattern in x / y.
         # zoom: scale the pattern about the frame center (1.0 = full size);
         # see __generate_buffer for why only x is scaled here.
+        # swapxy: 0 or 1, transpose the pattern (swap the x- and y-axes).
         self.lmx = lumax()
         ret = self.lmx.get_api_version()
         ret1 = self.lmx.get_physical_devices()
@@ -430,6 +431,7 @@ class lumax_renderer:
         self.mirrorx = mirrorx
         self.mirrory = mirrory
         self.zoom = zoom
+        self.swapxy = swapxy
         self.blanking_delay_ms = 0
 
     # context manager: `with lumax_renderer(numDev) as r:` stops the frame and
@@ -491,6 +493,9 @@ class lumax_renderer:
             # point struct), then mirror
             x = min(max(cx + (float(x) - cx) * self.zoom, 0), 255 * 255)
             return (255 * 255 * self.mirrorx) + (-1)**(self.mirrorx) * numpy.int32(x)
+        # source column feeding the device x / y: swapxy transposes the
+        # pattern (device x from the shape's y and vice versa)
+        sx, sy = (1, 0) if self.swapxy else (0, 1)
         # start in the center of the screen
         index = 0
         buffer.struct_arr[index].x = 128 * 255
@@ -503,8 +508,8 @@ class lumax_renderer:
             p = self.shapes[i].get_points()
             # insert blank point at the beginning
             index += 1
-            buffer.struct_arr[index].x = xout(p[0, 0])
-            buffer.struct_arr[index].y = xout(p[0, 1])
+            buffer.struct_arr[index].x = xout(p[0, sx])
+            buffer.struct_arr[index].y = xout(p[0, sy])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
@@ -512,16 +517,16 @@ class lumax_renderer:
             # copy the points
             for j in range(0, len(p)):
                 index += 1
-                buffer.struct_arr[index].x = xout(p[j, 0])
-                buffer.struct_arr[index].y = xout(p[j, 1])
+                buffer.struct_arr[index].x = xout(p[j, sx])
+                buffer.struct_arr[index].y = xout(p[j, sy])
                 buffer.struct_arr[index].r = p[j, 2]
                 buffer.struct_arr[index].g = p[j, 3]
                 buffer.struct_arr[index].b = p[j, 4]
 
             # insert blank point at the end
             index += 1
-            buffer.struct_arr[index].x = xout(p[len(p) - 1, 0])
-            buffer.struct_arr[index].y = xout(p[len(p) - 1, 1])
+            buffer.struct_arr[index].x = xout(p[len(p) - 1, sx])
+            buffer.struct_arr[index].y = xout(p[len(p) - 1, sy])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
