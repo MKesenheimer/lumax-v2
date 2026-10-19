@@ -62,6 +62,21 @@ static struct lumax_device detected_devices[MAX_DEVICES];
 static int num_detected_devices = 0;
 
 /*
+ * Global blanking delay in milliseconds (set by Lumax_SetBlankingDelay()).
+ *
+ * The X/Y galvo mirrors cannot change position instantaneously and the laser
+ * beam follows the physical mirror. If the light is switched on/off at the
+ * same instant a new X/Y is commanded, the beam is drawn while the mirrors
+ * are still in transit, smearing the start and end of every lit segment. The
+ * driver therefore shifts the light output relative to the X/Y output by this
+ * many milliseconds: Lumax_SendFrame() inserts (delay * scan_speed / 1000)
+ * compensation points at each light on/off transition (see the contract on
+ * Lumax_SetBlankingDelay() in liblumax.h and apply_blanking_delay() below).
+ * 0 = disabled (the default).
+ */
+static int global_blanking_delay = 0;
+
+/*
  * Fallback per-card configuration, applied by ghrkr().
  *
  * In liblumax.so these are the defaults ghrkr() writes into each of the 8
@@ -396,6 +411,104 @@ int Lumax_CloseDevice(int Handle)
     return result;
 }
 
+/* True if a point carries any light. The color channels are the 12-bit
+ * values stored in the high bytes (Ch3=red, Ch4=green, Ch5=blue) plus the
+ * flavor-specific extra channels (Ch6/Ch7/Ch8). A point is "lit" if any of
+ * them is non-zero. (TTL is a digital output, not light, so it is ignored.)
+ * Used to find the on/off transitions where the blanking delay applies. */
+static int point_is_lit(const TLumax_Point *p)
+{
+    return (p->Ch3 | p->Ch4 | p->Ch5 | p->Ch6 | p->Ch7 | p->Ch8) != 0;
+}
+
+/*
+ * Apply the global blanking delay to a point sequence (see the contract on
+ * Lumax_SetBlankingDelay() in liblumax.h). The X/Y galvo mirrors cannot
+ * respond instantaneously and the beam follows the physical mirror, so the
+ * light output is shifted relative to the X/Y output by
+ * global_blanking_delay ms:
+ *
+ *   - off->on transition (light turns ON at Points[i]): insert
+ *     global_blanking_delay * pps / 1000 BLANK points at the SAME X/Y as
+ *     Points[i] (all light channels 0) before it, so the mirrors reach the
+ *     position while the beam is off.
+ *   - on->off transition (light turns OFF at Points[i]): insert that many
+ *     LIT points repeating the last lit point (Points[i-1]) before Points[i],
+ *     so the beam stays on until the mirrors reach the off position.
+ *
+ * When global_blanking_delay is 0 (the default) the input is returned
+ * unchanged (no copy) and *out_count == NumOfPoints. Otherwise a newly
+ * malloc'ed array is returned (the caller frees it) and *out_count holds the
+ * expanded point count. On allocation failure returns NULL and *out_count=0.
+ */
+static TLumax_Point *apply_blanking_delay(TLumax_Point *Points, int NumOfPoints,
+                                          int pps, int *out_count)
+{
+    int delay_ms = global_blanking_delay;
+    if (delay_ms <= 0 || NumOfPoints <= 1) {
+        *out_count = NumOfPoints;
+        return Points;
+    }
+
+    int blank = delay_ms * pps / 1000;      /* points worth of `delay_ms` ms */
+    if (blank < 1)
+        blank = 1;                           /* sub-point delay still blanks 1 */
+    if (blank > 1000)
+        blank = 1000;                        /* bound the expansion */
+
+    /* First pass: count how many points will be inserted. */
+    int inserted = 0;
+    int lit_prev = point_is_lit(&Points[0]);
+    for (int i = 1; i < NumOfPoints; i++) {
+        int lit = point_is_lit(&Points[i]);
+        if (lit != lit_prev)
+            inserted += blank;
+        lit_prev = lit;
+    }
+
+    /* No on/off transitions (e.g. one continuous lit shape): nothing to
+       insert, so return the input unchanged and avoid a full copy. */
+    if (inserted == 0) {
+        *out_count = NumOfPoints;
+        return Points;
+    }
+
+    TLumax_Point *out = malloc(sizeof(TLumax_Point) * (size_t)(NumOfPoints + inserted));
+    if (!out) {
+        *out_count = 0;
+        return NULL;
+    }
+
+    /* Second pass: copy, splicing in the transition points. */
+    int o = 0;
+    lit_prev = point_is_lit(&Points[0]);
+    out[o++] = Points[0];
+    for (int i = 1; i < NumOfPoints; i++) {
+        int lit = point_is_lit(&Points[i]);
+        if (lit != lit_prev) {
+            TLumax_Point ins;
+            if (lit) {
+                /* off->on: blank points at the new (on) position. */
+                memset(&ins, 0, sizeof(ins));
+                ins.Ch1 = Points[i].Ch1;
+                ins.Ch2 = Points[i].Ch2;
+            } else {
+                /* on->off: repeat the last lit point to hold the beam on. */
+                ins = Points[i - 1];
+            }
+            for (int k = 0; k < blank; k++)
+                out[o++] = ins;
+        }
+        out[o++] = Points[i];
+        lit_prev = lit;
+    }
+
+    *out_count = o;
+    DBG("apply_blanking_delay: %d -> %d points (delay %d ms @ %d pps, %d inserted)",
+        NumOfPoints, o, delay_ms, pps, inserted);
+    return out;
+}
+
 int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanSpeed, int UpdateMode, int *TimeToWait)
 {
     (void)UpdateMode; /* the reference ignores this argument */
@@ -426,6 +539,18 @@ int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanS
         pps = 250;
     if (pps > dev->MaxScanSpeed)
         pps = dev->MaxScanSpeed;
+
+    /* Shift the light output relative to the X/Y output by the global
+       blanking delay: insert compensation points at each light on/off
+       transition (no-op, returns the input unchanged, when the delay is 0).
+       The expanded array is malloc'ed and must be freed before returning. */
+    int expanded_count = 0;
+    TLumax_Point *src = Points;
+    Points = apply_blanking_delay(src, NumOfPoints, pps, &expanded_count);
+    if (!Points)
+        return 1;
+    int points_owned = (Points != src);
+    NumOfPoints = expanded_count;
 
     /* Per-frame state (reference: v36[37..43]) */
     dev->NumberOfFramesSend++;
@@ -507,8 +632,11 @@ int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanS
         }
     }
     free(chunk);
-    if (tj_err)
+    if (tj_err) {
+        if (points_owned)
+            free(Points);
         return 1;
+    }
 
     /* Frame-end command (7 bytes): [3, rem_lo, rem_hi, div_lo, div_hi,
        final_counter, checksum]; divisor = FrameDivisor / scan_speed. */
@@ -558,6 +686,8 @@ int Lumax_SendFrame(int Handle, TLumax_Point *Points, int NumOfPoints, int ScanS
 
     /* Toggle the chunk counter 0 <-> 8 between frames. */
     dev->NextLoopCounts = (dev->NextLoopCounts != 0) ? 0 : 8;
+    if (points_owned)
+        free(Points);
     return ret;
 }
 
@@ -1805,13 +1935,14 @@ int readMemory(struct lumax_device *dev, uint8_t *arr, uint16_t start, uint16_t 
 
 void Lumax_SetBlankingDelay(int delay_ms)
 {
-    /* Store the blanking delay globally or per device */
-    /* For now, we'll just store it globally */
-    /* In a full implementation, this would be per-device state */
+    /* Set the global blanking delay (ms) applied by Lumax_SendFrame() via
+       apply_blanking_delay(). Negative values are clamped to 0 (disabled).
+       It takes effect on the next frame sent; 0 restores the default
+       (no compensation points inserted). */
     if (delay_ms < 0)
         delay_ms = 0;
-    static int global_blanking_delay = 0;
     global_blanking_delay = delay_ms;
+    DBG("Lumax_SetBlankingDelay: %d ms", delay_ms);
 }
 
 int dongleCom(struct lumax_device *dev, uint8_t flag, uint32_t address, uint8_t *writeBuffer, uint8_t *readBuffer)
