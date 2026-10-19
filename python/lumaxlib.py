@@ -493,6 +493,12 @@ class lumax_renderer:
             # point struct), then mirror
             x = min(max(cx + (float(x) - cx) * self.zoom, 0), 255 * 255)
             return (255 * 255 * self.mirrorx) + (-1)**(self.mirrorx) * numpy.int32(x)
+        def yout(x):
+                    # zoom about the center, clamp to the frame (zoom > 1 pushes
+                    # points outside, which must not wrap around in the 16 bit
+                    # point struct), then mirror
+                    x = min(max(cx + (float(x) - cx) * self.zoom, 0), 255 * 255)
+                    return (255 * 255 * self.mirrory) + (-1)**(self.mirrory) * numpy.int32(x)
         # source column feeding the device x / y: swapxy transposes the
         # pattern (device x from the shape's y and vice versa)
         sx, sy = (1, 0) if self.swapxy else (0, 1)
@@ -509,7 +515,7 @@ class lumax_renderer:
             # insert blank point at the beginning
             index += 1
             buffer.struct_arr[index].x = xout(p[0, sx])
-            buffer.struct_arr[index].y = xout(p[0, sy])
+            buffer.struct_arr[index].y = yout(p[0, sy])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
@@ -518,7 +524,7 @@ class lumax_renderer:
             for j in range(0, len(p)):
                 index += 1
                 buffer.struct_arr[index].x = xout(p[j, sx])
-                buffer.struct_arr[index].y = xout(p[j, sy])
+                buffer.struct_arr[index].y = yout(p[j, sy])
                 buffer.struct_arr[index].r = p[j, 2]
                 buffer.struct_arr[index].g = p[j, 3]
                 buffer.struct_arr[index].b = p[j, 4]
@@ -526,7 +532,7 @@ class lumax_renderer:
             # insert blank point at the end
             index += 1
             buffer.struct_arr[index].x = xout(p[len(p) - 1, sx])
-            buffer.struct_arr[index].y = xout(p[len(p) - 1, sy])
+            buffer.struct_arr[index].y = yout(p[len(p) - 1, sy])
             buffer.struct_arr[index].r = 0
             buffer.struct_arr[index].g = 0
             buffer.struct_arr[index].b = 0
