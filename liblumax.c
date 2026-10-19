@@ -1808,6 +1808,8 @@ void Lumax_SetBlankingDelay(int delay_ms)
     /* Store the blanking delay globally or per device */
     /* For now, we'll just store it globally */
     /* In a full implementation, this would be per-device state */
+    if (delay_ms < 0)
+        delay_ms = 0;
     static int global_blanking_delay = 0;
     global_blanking_delay = delay_ms;
 }
