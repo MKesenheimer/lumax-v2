@@ -25,23 +25,17 @@ class _lpoint(Structure):
                 ("TTL", c_uint16)]
 c_point_p = POINTER(_lpoint)
 
-class _lpoints(Structure):
-    #_pack_=2
-    _fields_ = [('length', c_int),
-                # an array of structs
-                ('struct_arr', c_point_p)]
-
-    def __init__(self, num_of_structs):
-        elems = (_lpoint * num_of_structs)()
-        self.struct_arr = cast(elems, c_point_p)
-        self.length = num_of_structs
-
-        for num in range(0, num_of_structs):
-            self.struct_arr[num].x = 0
-            self.struct_arr[num].y = 0
-            self.struct_arr[num].r = 0
-            self.struct_arr[num].g = 0
-            self.struct_arr[num].b = 0
+class _lpoints:
+    # a frame handed to the C driver: `length` points in `struct_arr`, a
+    # ctypes array of `_lpoint` structs backed by the caller's numpy buffer.
+    # `_lpoint` is 9 consecutive c_uint16 (18 bytes, no padding), so a
+    # C-contiguous uint16 (n, 9) array is byte-identical to the struct array
+    # and maps onto it directly with from_buffer.
+    def __init__(self, frame):
+        # frame: C-contiguous uint16 (total, 9) array [x, y, r, g, b,
+        # Ch6, Ch7, Ch8, TTL]
+        self.length = len(frame)
+        self.struct_arr = (_lpoint * self.length).from_buffer(frame)
 
 class shape:
     def __init__(self, points=None, color=None):
@@ -426,7 +420,7 @@ class lumax_renderer:
             print("[DEBUG] Lumax handle (device {}): {}".format(numDev, self.lhandle))
             #print("[DEBUG] SetTTL return: {}".format(lumax.setTTL(self.lhandle, 0)))
             print("[DEBUG] WaitForBuffer return: {}, {}, {}".format(ret2, timeToWait, bufferChanged))
-        self.shapes = numpy.array([])
+        self.shapes = []
         self.totnpoints = 0
         self.mirrorx = mirrorx
         self.mirrory = mirrory
@@ -456,11 +450,11 @@ class lumax_renderer:
         
 
     def new_frame(self):
-        self.shapes = numpy.array([])
+        self.shapes = []
         self.totnpoints = 0
 
     def add_shape_to_frame(self, shape):
-        self.shapes = numpy.append(self.shapes, shape)
+        self.shapes.append(shape)
         self.totnpoints += shape.get_number_of_points()
 
     def add_point_to_frame(self, point):
@@ -479,65 +473,54 @@ class lumax_renderer:
 
 
     def __generate_buffer(self):
-        # two extra points for every shape + one extra point in the center of the frame
-        nextrapoints = 2 * len(self.shapes) + 1
-        buffer = _lpoints(self.totnpoints + nextrapoints)
-        # scale x about the frame center, then apply the device-side mirror.
-        # y is NOT scaled: the backend sends display y inverted, so a zoom
-        # about the display center already maps to a zoom about the device
-        # center (scaling y here as well would double-flip it).
-        cx = 128 * 255
-        def xout(x):
-            # zoom about the center, clamp to the frame (zoom > 1 pushes
-            # points outside, which must not wrap around in the 16 bit
-            # point struct), then mirror
-            x = min(max(cx + (float(x) - cx) * self.zoom, 0), 255 * 255)
-            return (255 * 255 * self.mirrorx) + (-1)**(self.mirrorx) * numpy.int32(x)
-        def yout(x):
-                    # zoom about the center, clamp to the frame (zoom > 1 pushes
-                    # points outside, which must not wrap around in the 16 bit
-                    # point struct), then mirror
-                    x = min(max(cx + (float(x) - cx) * self.zoom, 0), 255 * 255)
-                    return (255 * 255 * self.mirrory) + (-1)**(self.mirrory) * numpy.int32(x)
+        # two extra (blank) points for every shape + one extra point in the
+        # center of the frame. Built as one vectorized uint16 (total, 9)
+        # array [x, y, r, g, b, Ch6, Ch7, Ch8, TTL] instead of a per-point
+        # ctypes loop.
+        nshapes = len(self.shapes)
+        total = self.totnpoints + 2 * nshapes + 1
+        frame = numpy.zeros((total, 9), dtype='uint16')
         # source column feeding the device x / y: swapxy transposes the
         # pattern (device x from the shape's y and vice versa)
         sx, sy = (1, 0) if self.swapxy else (0, 1)
+        cx = 128 * 255
+        full = 255 * 255
         # start in the center of the screen
-        index = 0
-        buffer.struct_arr[index].x = 128 * 255
-        buffer.struct_arr[index].y = 128 * 255
-        buffer.struct_arr[index].r = 0
-        buffer.struct_arr[index].g = 0
-        buffer.struct_arr[index].b = 0
-
-        for i in range(0, len(self.shapes)):
-            p = self.shapes[i].get_points()
+        frame[0, 0] = cx
+        frame[0, 1] = cx
+        def out(col, mirror):
+            # zoom about the center, clamp to the frame (zoom > 1 pushes
+            # points outside, which must not wrap around in the 16 bit
+            # point struct), then truncate to an integer, then mirror on the
+            # truncated value (matching the old scalar order: 65025 - int32
+            # of the clamped float). col is uint16; promote to float64 first
+            # so col - cx cannot underflow (matching the old float(x) cast).
+            c = numpy.clip(cx + (col.astype('float64') - cx) * self.zoom, 0, full)
+            c = c.astype('uint16')
+            if mirror:
+                c = full - c
+            return c
+        index = 1
+        for shp in self.shapes:
+            p = shp.get_points()
+            x = out(p[:, sx], self.mirrorx)
+            y = out(p[:, sy], self.mirrory)
             # insert blank point at the beginning
-            index += 1
-            buffer.struct_arr[index].x = xout(p[0, sx])
-            buffer.struct_arr[index].y = yout(p[0, sy])
-            buffer.struct_arr[index].r = 0
-            buffer.struct_arr[index].g = 0
-            buffer.struct_arr[index].b = 0
-            
+            frame[index, 0] = x[0]
+            frame[index, 1] = y[0]
             # copy the points
-            for j in range(0, len(p)):
-                index += 1
-                buffer.struct_arr[index].x = xout(p[j, sx])
-                buffer.struct_arr[index].y = yout(p[j, sy])
-                buffer.struct_arr[index].r = p[j, 2]
-                buffer.struct_arr[index].g = p[j, 3]
-                buffer.struct_arr[index].b = p[j, 4]
-
+            sl = slice(index + 1, index + 1 + len(p))
+            frame[sl, 0] = x
+            frame[sl, 1] = y
+            frame[sl, 2] = p[:, 2]
+            frame[sl, 3] = p[:, 3]
+            frame[sl, 4] = p[:, 4]
             # insert blank point at the end
-            index += 1
-            buffer.struct_arr[index].x = xout(p[len(p) - 1, sx])
-            buffer.struct_arr[index].y = yout(p[len(p) - 1, sy])
-            buffer.struct_arr[index].r = 0
-            buffer.struct_arr[index].g = 0
-            buffer.struct_arr[index].b = 0
-
-        return buffer
+            end = index + len(p) + 1
+            frame[end, 0] = x[-1]
+            frame[end, 1] = y[-1]
+            index = end + 1
+        return _lpoints(numpy.ascontiguousarray(frame, dtype='uint16'))
 
     def send_frame(self, pointrate : int):
         if len(self.shapes) == 0:
